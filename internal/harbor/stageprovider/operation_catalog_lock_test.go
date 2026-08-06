@@ -19,7 +19,7 @@ const (
 )
 
 func TestDeploymentOperationCatalogLockCanonicalStrictJSONAndFingerprint(t *testing.T) {
-	catalog, lock, _ := operationCatalogLockFixture(t, workflowadapter.RepoPrepare, workflowadapter.HarborRunQwen)
+	catalog, lock, _ := operationCatalogLockFixture(t, workflowadapter.RepoPrepare, workflowadapter.RepoAnalyze)
 	resolver, err := NewDeploymentOperationCatalogLockResolver(catalog, lock)
 	if err != nil {
 		t.Fatalf("construct catalog/lock resolver: %v", err)
@@ -58,12 +58,6 @@ func TestDeploymentOperationCatalogLockCanonicalStrictJSONAndFingerprint(t *test
 
 	reordered := lock.Clone()
 	reordered.Operations[0], reordered.Operations[1] = reordered.Operations[1], reordered.Operations[0]
-	// The evaluator fixture has more than one stable secret reference. Sorting
-	// the slice remains canonical for either cardinality and tests defensive
-	// copying as well.
-	if len(reordered.Operations[0].Secrets) > 1 {
-		reordered.Operations[0].Secrets[0], reordered.Operations[0].Secrets[1] = reordered.Operations[0].Secrets[1], reordered.Operations[0].Secrets[0]
-	}
 	canonicalJSON, err := reordered.CanonicalJSON()
 	if err != nil {
 		t.Fatal(err)
@@ -274,7 +268,7 @@ func TestDeploymentOperationCatalogLockRejectsDuplicateUnknownUnversionedAndRece
 		t.Fatalf("unknown operation error = %v, want lock drift", err)
 	}
 
-	missingCatalog, missingLock, _ := operationCatalogLockFixture(t, workflowadapter.RepoPrepare, workflowadapter.HarborRunQwen)
+	missingCatalog, missingLock, _ := operationCatalogLockFixture(t, workflowadapter.RepoPrepare, workflowadapter.RepoAnalyze)
 	missingLock.Operations = missingLock.Operations[:1]
 	if _, err := NewDeploymentOperationCatalogLockResolver(missingCatalog, missingLock); err == nil || !errors.Is(err, ErrDeploymentOperationCatalogLockDrift) {
 		t.Fatalf("missing catalog operation error = %v, want lock drift", err)
@@ -282,8 +276,19 @@ func TestDeploymentOperationCatalogLockRejectsDuplicateUnknownUnversionedAndRece
 }
 
 func TestDeploymentOperationCatalogLockRecordPinsContainerAndAgentIdentities(t *testing.T) {
-	_, containerLock, _ := operationCatalogLockFixture(t, workflowadapter.HarborRunQwen)
-	container := containerLock.Operations[0]
+	_, localLock, _ := operationCatalogLockFixture(t, workflowadapter.RepoPrepare)
+	container := localLock.Operations[0].Clone()
+	containerImageDigest := "registry.example/harbor/evaluator@sha256:" + strings.Repeat("a", 64)
+	container.Operation.Payload = workflowadapter.ContainerCommandOperationPayload{
+		ImageDigest: containerImageDigest,
+		Command:     []string{"harbor-evaluator"},
+	}
+	container.ExecutionKind = workflowadapter.StageOperationPayloadContainerCommand
+	container.LocalExecutable = nil
+	container.ContainerRuntime = &PinnedContainerRuntimeLock{
+		ImageDigest: containerImageDigest,
+		Runtime:     container.Runtime,
+	}
 	if container.ContainerRuntime == nil {
 		t.Fatal("container fixture did not create a pinned runtime record")
 	}
@@ -296,7 +301,7 @@ func TestDeploymentOperationCatalogLockRecordPinsContainerAndAgentIdentities(t *
 		t.Fatalf("container runtime drift error = %v, want invalid lock", err)
 	}
 	containerImageDrift := container.Clone()
-	containerImageDrift.ContainerRuntime.ImageDigest = "registry.example/harbor/evaluator@sha256:" + strings.Repeat("a", 64)
+	containerImageDrift.ContainerRuntime.ImageDigest = "registry.example/harbor/evaluator@sha256:" + strings.Repeat("b", 64)
 	if err := containerImageDrift.Validate(); err == nil || !errors.Is(err, ErrInvalidDeploymentOperationCatalogLock) {
 		t.Fatalf("container image drift error = %v, want invalid lock", err)
 	}

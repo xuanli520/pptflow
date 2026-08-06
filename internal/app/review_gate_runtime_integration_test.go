@@ -159,7 +159,7 @@ func TestFrozenExecutionRuntimeApprovedReviewGateMaterializesArtifactAndSchedule
 	}
 }
 
-// This follows the same durable path as a CodeEdge final_review approval:
+// This follows the same durable path as a final_review approval:
 // ResolveReview -> projectResolvedReviewGate -> enqueueNextCoordinator ->
 // workflow_run.execute. The predecessor Run is frozen under an older catalog
 // lock version, and the resolution and successor coordinator continue under a

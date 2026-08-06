@@ -6,7 +6,6 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/stageprovider"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
@@ -14,7 +13,7 @@ import (
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
-func TestHarborFlowProductionCompositionInstallsThreeIndependentTemplateBundles(t *testing.T) {
+func TestHarborFlowProductionCompositionInstallsStandardAuthoringTemplateBundle(t *testing.T) {
 	fixture := newHarborFlowProductionCompositionFixture(t)
 	dataStore, err := store.OpenForTest(t.TempDir())
 	if err != nil {
@@ -36,24 +35,11 @@ func TestHarborFlowProductionCompositionInstallsThreeIndependentTemplateBundles(
 		t.Fatalf("production composition looked up %d environment values before execution", lookups)
 	}
 
-	if fixture.config.StandardBinding.CatalogReceiptFingerprint == fixture.config.CodeEdgePhase1Binding.CatalogReceiptFingerprint ||
-		fixture.config.StandardBinding.CatalogReceiptFingerprint == fixture.config.EvaluatorBinding.CatalogReceiptFingerprint ||
-		fixture.config.CodeEdgePhase1Binding.CatalogReceiptFingerprint == fixture.config.EvaluatorBinding.CatalogReceiptFingerprint {
-		t.Fatal("test fixture must use three distinct deployment catalog receipts")
-	}
-	if fixture.config.StandardBinding.LockIdentity == fixture.config.CodeEdgePhase1Binding.LockIdentity ||
-		fixture.config.StandardBinding.LockIdentity == fixture.config.EvaluatorBinding.LockIdentity ||
-		fixture.config.CodeEdgePhase1Binding.LockIdentity == fixture.config.EvaluatorBinding.LockIdentity {
-		t.Fatal("test fixture must use three distinct deployment lock identities")
-	}
-
 	router, ok := services.WorkflowkitProviderOperationResolver().(*stageprovider.TemplateWorkflowkitProviderOperationResolver)
 	if !ok || router == nil {
 		t.Fatalf("production operation resolver = %T, want template-scoped router", services.WorkflowkitProviderOperationResolver())
 	}
 	wantTemplates := []workflowadapter.TemplateReference{
-		workflowadapter.CodeEdgeEvaluatorChildTemplateReference(),
-		workflowadapter.CodeEdgePhase1TemplateReference(),
 		workflowadapter.StandardAuthoringCurrentTemplateReference(),
 	}
 	if got := router.Templates(); !reflect.DeepEqual(got, wantTemplates) {
@@ -65,9 +51,6 @@ func TestHarborFlowProductionCompositionInstallsThreeIndependentTemplateBundles(
 
 	if services.AuthoringLaunches == nil || !services.AuthoringLaunches.Available() {
 		t.Fatal("unified production composition omitted the Standard source capture and definition capability")
-	}
-	if services.EvaluatorLaunches == nil || !services.EvaluatorLaunches.Available() {
-		t.Fatal("unified production composition omitted the lock-owned evaluator-child definition capability")
 	}
 	if services.RunActivations == nil || !services.RunActivations.Available() {
 		t.Fatal("unified production composition omitted the queued Run activation capability")
@@ -83,19 +66,7 @@ func TestHarborFlowProductionCompositionInstallsThreeIndependentTemplateBundles(
 			name:     "Standard authoring",
 			template: workflowadapter.StandardAuthoringCurrentTemplateReference(),
 			record:   fixture.standardLock.Operations[0],
-			wrong:    workflowadapter.CodeEdgePhase1TemplateReference(),
-		},
-		{
-			name:     "CodeEdge Phase-1 parent",
-			template: workflowadapter.CodeEdgePhase1TemplateReference(),
-			record:   fixture.parentLock.Operations[0],
-			wrong:    workflowadapter.CodeEdgeEvaluatorChildTemplateReference(),
-		},
-		{
-			name:     "CodeEdge evaluator child",
-			template: workflowadapter.CodeEdgeEvaluatorChildTemplateReference(),
-			record:   fixture.evaluatorLock.Operations[0],
-			wrong:    workflowadapter.StandardAuthoringCurrentTemplateReference(),
+			wrong:    workflowadapter.TemplateReference{ID: workflowadapter.StandardAuthoringWorkflowTemplateID, Version: "2.0.0"},
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -121,13 +92,13 @@ func TestHarborFlowProductionCompositionRejectsMismatchedBundleBuildIdentity(t *
 	defer dataStore.Close()
 
 	config := fixture.config
-	config.CodeEdgePhase1Binding.HarborFlowBuild.ContentSHA256 = workflowkit.SHA256Fingerprint([]byte("different-parent-build"))
-	if _, err := newHarborFlowProductionLifecycleServicesWithConfig(t.TempDir(), dataStore, config); err == nil || !strings.Contains(err.Error(), "all three production deployment locks must bind the same Harbor Flow build identity") {
-		t.Fatalf("mismatched three-bundle build identity error = %v", err)
+	config.StandardBinding.HarborFlowBuild.ContentSHA256 = workflowkit.SHA256Fingerprint([]byte("different-standard-build"))
+	if _, err := newHarborFlowProductionLifecycleServicesWithConfig(t.TempDir(), dataStore, config); err == nil || !strings.Contains(err.Error(), "production build identity does not match") {
+		t.Fatalf("mismatched bundle build identity error = %v", err)
 	}
 }
 
-func TestProductionDeploymentPathsBesideExecutableRequiresAllThreeBundlesAndStandardContractManifest(t *testing.T) {
+func TestProductionDeploymentPathsBesideExecutableRequiresStandardBundleAndContractManifest(t *testing.T) {
 	packageRoot := t.TempDir()
 	executable := filepath.Join(packageRoot, "harbor-factory")
 	if err := os.WriteFile(executable, []byte("binary"), 0o755); err != nil {
@@ -141,10 +112,6 @@ func TestProductionDeploymentPathsBesideExecutableRequiresAllThreeBundlesAndStan
 	deployments := filepath.Join(packageRoot, productionDeploymentsDirectory)
 	standard := filepath.Join(deployments, standardAuthoringDeploymentDirectory)
 	rootCompositionWritePathFixtureBundle(t, standard, true, true)
-	parent := filepath.Join(deployments, codeEdgePhase1DeploymentDirectory)
-	rootCompositionWritePathFixtureBundle(t, parent, true, true)
-	evaluator := filepath.Join(deployments, codeEdgeEvaluatorChildDeploymentDirectory)
-	rootCompositionWritePathFixtureBundle(t, evaluator, true, true)
 	if _, err := productionDeploymentPathsBesideExecutable(executable); err == nil || !strings.Contains(err.Error(), "Standard authoring contract asset manifest") {
 		t.Fatalf("package without Standard contract manifest error = %v", err)
 	}
@@ -154,34 +121,22 @@ func TestProductionDeploymentPathsBesideExecutableRequiresAllThreeBundlesAndStan
 	}
 	rootCompositionWritePathFixtureFile(t, filepath.Join(standard, filepath.FromSlash(stageprovider.StandardAuthoringSSHKnownHostsRelativePath)))
 
-	if err := os.Remove(filepath.Join(parent, productionDeploymentLockFile)); err != nil {
+	if err := os.Remove(filepath.Join(standard, productionDeploymentLockFile)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := productionDeploymentPathsBesideExecutable(executable); err == nil || !strings.Contains(err.Error(), "CodeEdge Phase-1 lock") {
-		t.Fatalf("package with incomplete parent bundle error = %v", err)
+	if _, err := productionDeploymentPathsBesideExecutable(executable); err == nil || !strings.Contains(err.Error(), "Standard authoring lock") {
+		t.Fatalf("package with incomplete Standard bundle error = %v", err)
 	}
-	rootCompositionWritePathFixtureFile(t, filepath.Join(parent, productionDeploymentLockFile))
-
-	if err := os.Remove(filepath.Join(evaluator, productionDeploymentLockFile)); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := productionDeploymentPathsBesideExecutable(executable); err == nil || !strings.Contains(err.Error(), "CodeEdge evaluator child lock") {
-		t.Fatalf("package with incomplete evaluator bundle error = %v", err)
-	}
-	rootCompositionWritePathFixtureFile(t, filepath.Join(evaluator, productionDeploymentLockFile))
+	rootCompositionWritePathFixtureFile(t, filepath.Join(standard, productionDeploymentLockFile))
 
 	paths, err := productionDeploymentPathsBesideExecutable(executable)
 	if err != nil {
-		t.Fatalf("complete three-bundle package rejected: %v", err)
+		t.Fatalf("complete Standard bundle package rejected: %v", err)
 	}
 	want := productionDeploymentPaths{
 		StandardCatalog:      filepath.Join(standard, productionDeploymentCatalogFile),
 		StandardLock:         filepath.Join(standard, productionDeploymentLockFile),
 		StandardContractRoot: standard,
-		ParentCatalog:        filepath.Join(parent, productionDeploymentCatalogFile),
-		ParentLock:           filepath.Join(parent, productionDeploymentLockFile),
-		EvaluatorCatalog:     filepath.Join(evaluator, productionDeploymentCatalogFile),
-		EvaluatorLock:        filepath.Join(evaluator, productionDeploymentLockFile),
 	}
 	if paths != want {
 		t.Fatalf("production deployment paths = %#v, want %#v", paths, want)
@@ -203,7 +158,7 @@ func TestPreflightHarborFlowProductionDeploymentBundlesRejectsStaleLockWithoutMa
 		t.Fatal(err)
 	}
 	managedRoot := filepath.Join(t.TempDir(), "managed-control-plane")
-	err = preflightHarborFlowProductionDeploymentBundles(fixture.config.Paths, fixture.config.StandardBinding, fixture.config.CodeEdgePhase1Binding, fixture.config.EvaluatorBinding)
+	err = preflightHarborFlowProductionDeploymentBundles(fixture.config.Paths, fixture.config.StandardBinding)
 	if err == nil || !strings.Contains(err.Error(), "Standard authoring") {
 		t.Fatalf("stale Standard lock preflight error = %v", err)
 	}
@@ -211,10 +166,8 @@ func TestPreflightHarborFlowProductionDeploymentBundlesRejectsStaleLockWithoutMa
 }
 
 type harborFlowProductionCompositionFixture struct {
-	config        harborFlowProductionCompositionConfig
-	standardLock  stageprovider.DeploymentOperationCatalogLock
-	parentLock    stageprovider.DeploymentOperationCatalogLock
-	evaluatorLock stageprovider.DeploymentOperationCatalogLock
+	config       harborFlowProductionCompositionConfig
+	standardLock stageprovider.DeploymentOperationCatalogLock
 }
 
 func newHarborFlowProductionCompositionFixture(t *testing.T) harborFlowProductionCompositionFixture {
@@ -233,193 +186,19 @@ func newHarborFlowProductionCompositionFixture(t *testing.T) harborFlowProductio
 	standardLock.HarborFlowBuild = build
 	rootCompositionWriteLock(t, filepath.Join(standard, productionDeploymentLockFile), standardLock)
 
-	sourceRoot := standardAuthoringProductionRepositoryRoot(t)
-	parent := filepath.Join(deployments, codeEdgePhase1DeploymentDirectory)
-	copyStandardAuthoringDeploymentTree(t, filepath.Join(sourceRoot, productionDeploymentsDirectory, codeEdgePhase1DeploymentDirectory), parent)
-	parentLock := rootCompositionParentLock(t, filepath.Join(parent, productionDeploymentCatalogFile), build)
-	rootCompositionWriteLock(t, filepath.Join(parent, productionDeploymentLockFile), parentLock)
-
-	evaluator := filepath.Join(deployments, codeEdgeEvaluatorChildDeploymentDirectory)
-	copyStandardAuthoringDeploymentTree(t, filepath.Join(sourceRoot, productionDeploymentsDirectory, codeEdgeEvaluatorChildDeploymentDirectory), evaluator)
-	evaluatorLock := rootCompositionEvaluatorLock(t, filepath.Join(evaluator, productionDeploymentCatalogFile), build)
-	rootCompositionWriteLock(t, filepath.Join(evaluator, productionDeploymentLockFile), evaluatorLock)
-
 	standardReceipt, standardIdentity := rootCompositionLockBinding(t, standardLock)
-	parentReceipt, parentIdentity := rootCompositionLockBinding(t, parentLock)
-	evaluatorReceipt, evaluatorIdentity := rootCompositionLockBinding(t, evaluatorLock)
 	return harborFlowProductionCompositionFixture{
 		config: harborFlowProductionCompositionConfig{
 			Paths: productionDeploymentPaths{
 				StandardCatalog:      filepath.Join(standard, productionDeploymentCatalogFile),
 				StandardLock:         filepath.Join(standard, productionDeploymentLockFile),
 				StandardContractRoot: standard,
-				ParentCatalog:        filepath.Join(parent, productionDeploymentCatalogFile),
-				ParentLock:           filepath.Join(parent, productionDeploymentLockFile),
-				EvaluatorCatalog:     filepath.Join(evaluator, productionDeploymentCatalogFile),
-				EvaluatorLock:        filepath.Join(evaluator, productionDeploymentLockFile),
 			},
 			StandardBinding: standardAuthoringProductionBuildBinding{
 				HarborFlowBuild: build, CatalogReceiptFingerprint: standardReceipt, LockIdentity: standardIdentity,
 			},
-			CodeEdgePhase1Binding: codeEdgePhase1ProductionBuildBinding{
-				HarborFlowBuild: build, CatalogReceiptFingerprint: parentReceipt, LockIdentity: parentIdentity,
-			},
-			EvaluatorBinding: codeEdgeProductionBuildBinding{
-				HarborFlowBuild: build, CatalogReceiptFingerprint: evaluatorReceipt, LockIdentity: evaluatorIdentity,
-			},
 		},
-		standardLock: standardLock, parentLock: parentLock, evaluatorLock: evaluatorLock,
-	}
-}
-
-func rootCompositionParentLock(t *testing.T, catalogPath string, build stageprovider.HarborFlowBuildIdentity) stageprovider.DeploymentOperationCatalogLock {
-	t.Helper()
-	catalog := rootCompositionCatalog(t, catalogPath)
-	lock := stageprovider.DeploymentOperationCatalogLock{
-		Format: stageprovider.DeploymentOperationCatalogLockFormat, Version: stageprovider.DeploymentOperationCatalogLockVersion,
-		LockID: "root-composition-codeedge-phase1", LockVersion: "1.0.0", CatalogReceipt: catalog.Receipt(), HarborFlowBuild: build,
-		CodeEdgePhase1ExecutionProfile:      &stageprovider.CodeEdgePhase1ExecutionProfileLock{Profile: codeEdgePhase1DefinitionProviderProfile(t)},
-		CodeEdgePhase1PreflightProfile:      &stageprovider.CodeEdgePhase1PreflightProfileLock{Profile: codeEdgePhase1DefinitionProviderPreflightProfile(t)},
-		CodeEdgePhase1FinalCompliancePolicy: &stageprovider.CodeEdgePhase1FinalCompliancePolicyLock{Policy: codeEdgePhase1DefinitionProviderPolicy()},
-		Operations:                          make([]stageprovider.DeploymentOperationCatalogLockRecord, 0, len(catalog.Catalog().Operations)),
-	}
-	for _, registration := range catalog.Catalog().Operations {
-		lock.Operations = append(lock.Operations, rootCompositionParentLockRecord(t, registration))
-	}
-	if _, err := stageprovider.NewDeploymentOperationCatalogLockResolver(catalog, lock); err != nil {
-		t.Fatalf("construct parent fixture catalog lock: %v", err)
-	}
-	return lock
-}
-
-func rootCompositionParentLockRecord(t *testing.T, registration stageprovider.DeploymentOperationRegistration) stageprovider.DeploymentOperationCatalogLockRecord {
-	t.Helper()
-	record := rootCompositionLockRecord(registration)
-	switch payload := registration.Operation.Payload.(type) {
-	case workflowadapter.LocalCommandOperationPayload:
-		record.LocalExecutable = &stageprovider.LocalExecutableLock{
-			CommandID: payload.CommandID, AbsolutePath: "/opt/harbor-factory-test/" + payload.CommandID, Version: "1.0.0",
-			ContentSHA256: workflowkit.SHA256Fingerprint([]byte("parent-command:" + payload.CommandID)),
-		}
-	case workflowadapter.HarborBuiltinOperationPayload:
-		record.HarborFlowBuiltin = &stageprovider.HarborFlowBuiltinOperationLock{
-			Format: stageprovider.HarborFlowBuiltinOperationLockFormat, Version: stageprovider.HarborFlowBuiltinOperationLockVersion,
-			HandlerID: payload.HandlerID, HandlerVersion: "1.0.0",
-		}
-	case workflowadapter.DurableReviewOperationPayload:
-		record.DurableReviewPolicy = &stageprovider.DurableReviewPolicyLock{PolicyID: payload.PolicyID, Version: "1.0.0"}
-	default:
-		t.Fatalf("unsupported parent fixture payload %T", payload)
-	}
-	return record
-}
-
-func rootCompositionEvaluatorLock(t *testing.T, catalogPath string, build stageprovider.HarborFlowBuildIdentity) stageprovider.DeploymentOperationCatalogLock {
-	t.Helper()
-	catalog := rootCompositionCatalog(t, catalogPath)
-	lock := stageprovider.DeploymentOperationCatalogLock{
-		Format: stageprovider.DeploymentOperationCatalogLockFormat, Version: stageprovider.DeploymentOperationCatalogLockVersion,
-		LockID: "root-composition-codeedge-evaluator", LockVersion: "1.0.0", CatalogReceipt: catalog.Receipt(), HarborFlowBuild: build,
-		CodeEdgeEvaluatorChildExecutionProfile: &stageprovider.CodeEdgeEvaluatorChildExecutionProfileLock{Profile: rootCompositionEvaluatorProfile(t)},
-		Operations:                             make([]stageprovider.DeploymentOperationCatalogLockRecord, 0, len(catalog.Catalog().Operations)),
-	}
-	for _, registration := range catalog.Catalog().Operations {
-		payload, ok := registration.Operation.Payload.(workflowadapter.LocalCommandOperationPayload)
-		if !ok || registration.HarborEvaluator == nil {
-			t.Fatalf("evaluator fixture registration %q is not a locked local Harbor evaluator operation", registration.Stage.Key)
-		}
-		launcher := stageprovider.LocalExecutableLock{
-			CommandID: payload.CommandID, AbsolutePath: "/opt/harbor-factory-test/" + payload.CommandID, Version: "0.18.0",
-			ContentSHA256: workflowkit.SHA256Fingerprint([]byte("evaluator-launcher:" + payload.CommandID)),
-		}
-		record := rootCompositionLockRecord(registration)
-		record.LocalExecutable = &launcher
-		record.HarborEvaluator = &stageprovider.HarborEvaluatorOperationLock{
-			Contract: registration.HarborEvaluator.Clone(), Launcher: launcher,
-			ClaudeCodeExecutable: stageprovider.LocalExecutableLock{
-				CommandID: stageprovider.HarborEvaluatorClaudeCodeCommandID, AbsolutePath: "/opt/harbor-factory-test/claude", Version: registration.HarborEvaluator.AgentVersion,
-				ContentSHA256: workflowkit.SHA256Fingerprint([]byte("evaluator-claude-code")),
-			},
-			PythonInterpreter: stageprovider.LocalExecutableLock{
-				CommandID: stageprovider.HarborEvaluatorPythonCommandID, AbsolutePath: "/opt/harbor-factory-test/python3", Version: "3.13.0",
-				ContentSHA256: workflowkit.SHA256Fingerprint([]byte("evaluator-python")),
-			},
-			PythonSourceTree: stageprovider.HarborPythonSourceTreeLock{
-				AbsolutePath: "/opt/harbor-factory-test/site-packages/harbor", PythonFilesSHA256: workflowkit.SHA256Fingerprint([]byte("evaluator-python-tree")),
-			},
-			DockerCLI: stageprovider.LocalExecutableLock{
-				CommandID: stageprovider.HarborEvaluatorDockerCommandID, AbsolutePath: "/opt/harbor-factory-test/docker", Version: stageprovider.HarborEvaluatorDockerVersion,
-				ContentSHA256: workflowkit.SHA256Fingerprint([]byte("evaluator-docker")),
-			},
-			DockerServerVersion: stageprovider.HarborEvaluatorDockerServerVersion,
-			DockerComposePlugin: stageprovider.LocalExecutableLock{
-				CommandID: stageprovider.HarborEvaluatorDockerComposeCommandID, AbsolutePath: "/opt/harbor-factory-test/cli-plugins/docker-compose", Version: stageprovider.HarborEvaluatorDockerComposeVersion,
-				ContentSHA256: workflowkit.SHA256Fingerprint([]byte("evaluator-docker-compose")),
-			},
-			DockerBuildxPlugin: stageprovider.LocalExecutableLock{
-				CommandID: stageprovider.HarborEvaluatorDockerBuildxCommandID, AbsolutePath: "/opt/harbor-factory-test/cli-plugins/docker-buildx", Version: stageprovider.HarborEvaluatorDockerBuildxVersion,
-				ContentSHA256: workflowkit.SHA256Fingerprint([]byte("evaluator-docker-buildx")),
-			},
-			HarborVersionOutput: stageprovider.HarborEvaluatorHarborVersion, DockerComposeVersionOutput: stageprovider.HarborEvaluatorDockerComposeVersionOutput,
-			DockerBuildxVersionOutput: stageprovider.HarborEvaluatorDockerBuildxVersionOutput,
-		}
-		lock.Operations = append(lock.Operations, record)
-	}
-	if _, err := stageprovider.NewDeploymentOperationCatalogLockResolver(catalog, lock); err != nil {
-		t.Fatalf("construct evaluator fixture catalog lock: %v", err)
-	}
-	return lock
-}
-
-func rootCompositionEvaluatorProfile(t *testing.T) workflowadapter.ExecutionProfile {
-	t.Helper()
-	template := workflowadapter.CodeEdgeEvaluatorChildWorkflowTemplate()
-	profile := workflowadapter.ExecutionProfile{
-		Template: template.Reference(), ID: "root-composition-evaluator", Version: "1.0.0",
-		ContinuationPlanTTL: workflowadapter.RequiredContinuationPlanTTL, ControlGracePeriod: time.Minute,
-		CandidateProviderBudget: workflowadapter.CandidateProviderBudget{AttemptTimeout: 5 * time.Minute},
-		Stages:                  make([]workflowadapter.StageBudget, 0, len(template.Catalog.Stages)),
-	}
-	for _, stage := range template.Catalog.Stages {
-		turns := stage.RequiredTurns
-		if turns < 1 {
-			turns = 1
-		}
-		attempt := time.Duration(turns) * time.Minute
-		profile.Stages = append(profile.Stages, workflowadapter.StageBudget{StageKey: stage.Key, Budget: workflowkit.ExecutionBudget{
-			TurnTimeout: time.Minute, MaxTurns: turns, AttemptTimeout: attempt, MaxAttempts: 1, MaxElapsed: attempt,
-		}})
-	}
-	if err := profile.Validate(); err != nil {
-		t.Fatalf("construct evaluator fixture profile: %v", err)
-	}
-	return profile
-}
-
-func rootCompositionCatalog(t *testing.T, path string) *stageprovider.DeploymentOperationCatalogResolver {
-	t.Helper()
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	document, err := stageprovider.ParseDeploymentOperationCatalogJSON(raw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	catalog, err := stageprovider.NewDeploymentOperationCatalogResolver(document)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return catalog
-}
-
-func rootCompositionLockRecord(registration stageprovider.DeploymentOperationRegistration) stageprovider.DeploymentOperationCatalogLockRecord {
-	return stageprovider.DeploymentOperationCatalogLockRecord{
-		Stage: registration.Stage, Provider: registration.Provider, Operation: registration.Operation.Clone(), Runtime: registration.Runtime,
-		Checkout: registration.Checkout, Secrets: append([]workflowadapter.SecretReference{}, registration.Secrets...),
-		PromptContentFingerprint: workflowkit.SHA256Fingerprint([]byte("root-composition-prompt:" + string(registration.Stage.Key))),
-		SchemaContentFingerprint: workflowkit.SHA256Fingerprint([]byte("root-composition-schema:" + string(registration.Stage.Key))),
-		ExecutionKind:            registration.Operation.Payload.Kind(),
+		standardLock: standardLock,
 	}
 }
 

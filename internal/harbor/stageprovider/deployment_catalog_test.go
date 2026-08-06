@@ -61,39 +61,40 @@ func TestDeploymentOperationCatalogResolverAcceptsOnlyExactFrozenContract(t *tes
 }
 
 func TestDeploymentOperationCatalogBindsExactClosedTemplateWithoutFallback(t *testing.T) {
-	codeEdgeSpec := testsupport.CompleteCodeEdgePhase1RunExecutionSpec(deploymentCatalogTestTaskID, deploymentCatalogTestRevisionID, deploymentCatalogTestDigest)
-	codeEdgeCatalog := deploymentCatalogForExecutionSpec(t, codeEdgeSpec)
-	resolver, err := NewDeploymentOperationCatalogResolver(codeEdgeCatalog)
+	standardSpec := testsupport.CompleteRunExecutionSpec(deploymentCatalogTestTaskID, deploymentCatalogTestRevisionID, deploymentCatalogTestDigest)
+	standardCatalog := deploymentCatalogForExecutionSpec(t, standardSpec)
+	resolver, err := NewDeploymentOperationCatalogResolver(standardCatalog)
 	if err != nil {
-		t.Fatalf("construct CodeEdge catalog resolver: %v", err)
+		t.Fatalf("construct Standard catalog resolver: %v", err)
 	}
-	if got, want := resolver.Template(), workflowadapter.CodeEdgePhase1TemplateReference(); !got.Equal(want) {
+	if got, want := resolver.Template(), workflowadapter.StandardTemplateReference(); !got.Equal(want) {
 		t.Fatalf("catalog template = %+v, want %+v", got, want)
 	}
-	if err := resolver.ValidateExecutionSpec(codeEdgeSpec); err != nil {
-		t.Fatalf("validate exact CodeEdge frozen execution spec: %v", err)
+	if err := resolver.ValidateExecutionSpec(standardSpec); err != nil {
+		t.Fatalf("validate exact Standard frozen execution spec: %v", err)
 	}
-	if _, err := resolver.ResolveExecutionSpecStageOperation(codeEdgeSpec, workflowadapter.CodeEdgeLint); err != nil {
-		t.Fatalf("resolve CodeEdge-only template stage: %v", err)
-	}
-
-	standardSpec := testsupport.CompleteRunExecutionSpec(deploymentCatalogTestTaskID, deploymentCatalogTestRevisionID, deploymentCatalogTestDigest)
-	if err := resolver.ValidateExecutionSpec(standardSpec); err == nil || !errors.Is(err, ErrDeploymentOperationCatalogDrift) {
-		t.Fatalf("Standard spec against CodeEdge catalog = %v, want template drift", err)
-	}
-	if _, err := resolver.ResolveExecutionSpecStageOperation(standardSpec, workflowadapter.RepoPrepare); err == nil || !errors.Is(err, ErrDeploymentOperationCatalogDrift) {
-		t.Fatalf("Standard stage resolution against CodeEdge catalog = %v, want template drift", err)
+	if _, err := resolver.ResolveExecutionSpecStageOperation(standardSpec, workflowadapter.CodeEdgeLint); err != nil {
+		t.Fatalf("resolve Standard-only template stage: %v", err)
 	}
 
-	missingTemplate := codeEdgeCatalog.Clone()
+	authoringSpec := standardSpec.Clone()
+	authoringSpec.Template = workflowadapter.StandardAuthoringCurrentTemplateReference()
+	if err := resolver.ValidateExecutionSpec(authoringSpec); err == nil || !errors.Is(err, ErrDeploymentOperationCatalogDrift) {
+		t.Fatalf("authoring spec against Standard catalog = %v, want template drift", err)
+	}
+	if _, err := resolver.ResolveExecutionSpecStageOperation(authoringSpec, workflowadapter.RepoPrepare); err == nil || !errors.Is(err, ErrDeploymentOperationCatalogDrift) {
+		t.Fatalf("authoring stage resolution against Standard catalog = %v, want template drift", err)
+	}
+
+	missingTemplate := standardCatalog.Clone()
 	missingTemplate.Template = workflowadapter.TemplateReference{}
 	if err := missingTemplate.Validate(); err == nil || !errors.Is(err, ErrInvalidDeploymentOperationCatalog) {
 		t.Fatalf("template-less catalog validation = %v, want invalid catalog", err)
 	}
-	wrongTemplate := codeEdgeCatalog.Clone()
-	wrongTemplate.Template = workflowadapter.StandardTemplateReference()
+	wrongTemplate := standardCatalog.Clone()
+	wrongTemplate.Template = workflowadapter.StandardAuthoringCurrentTemplateReference()
 	if err := wrongTemplate.Validate(); err == nil || !errors.Is(err, ErrInvalidDeploymentOperationCatalog) {
-		t.Fatalf("CodeEdge registrations under Standard template = %v, want invalid catalog", err)
+		t.Fatalf("Standard registrations under authoring template = %v, want invalid catalog", err)
 	}
 }
 

@@ -20,7 +20,7 @@ func TestStandardStageCatalogCoversAllNodesAndGroups(t *testing.T) {
 	if got, want := len(catalog.Stages), len(lifecycleNodeOrder()); got != want {
 		t.Fatalf("catalog node count = %d, want %d", got, want)
 	}
-	if got, want := len(StandardStageGroups()), 11; got != want {
+	if got, want := len(StandardStageGroups()), 9; got != want {
 		t.Fatalf("standard group count = %d, want %d", got, want)
 	}
 	for _, node := range lifecycleNodeOrder() {
@@ -61,7 +61,6 @@ func TestCatalogRepresentsGatesAsDurableReviewStages(t *testing.T) {
 		workflowkit.StageKey(ContentReview):  {ReviewContent, "content_review_decision"},
 		workflowkit.StageKey(SolutionReview): {ReviewSolutionVerifier, "solution_review_decision"},
 		workflowkit.StageKey(FinalReview):    {ReviewFinalQuality, "final_review_decision"},
-		workflowkit.StageKey(ResultReview):   {ReviewModelResult, "model_result_decision"},
 	}
 	if got, want := len(resolved.ReviewStages), len(expected); got != want {
 		t.Fatalf("review stage count = %d, want %d", got, want)
@@ -112,9 +111,7 @@ func TestGateDecisionArtifactsMatchEveryDirectConsumer(t *testing.T) {
 	}{
 		{TaskReview, GenerateTaskFiles},
 		{SolutionReview, MaterializeTask},
-		{FinalReview, HarborRunQwen},
-		{FinalReview, HarborRunOpus},
-		{ResultReview, SubmissionLint},
+		{FinalReview, Package},
 	}
 	for _, check := range checks {
 		producer, ok := catalog.Stage(check.producer)
@@ -375,8 +372,8 @@ func TestRepairFirstPolicyAndResourceMapping(t *testing.T) {
 	if !present || localPackage.Effect != workflowkit.EffectExternalSideEffect || localPackage.Plugin.ID != "harborfactory.local_package" || !localPackage.Dispatch.IsOperatorOnly() {
 		t.Fatalf("local package delivery mapping = %#v, want the managed local package stage", localPackage)
 	}
-	if len(localPackage.Dependencies) != 1 || localPackage.Dependencies[0] != workflowkit.StageKey(SubmissionLint) {
-		t.Fatalf("local package must depend directly on submission lint: %#v", localPackage.Dependencies)
+	if len(localPackage.Dependencies) != 1 || localPackage.Dependencies[0] != workflowkit.StageKey(FinalReview) {
+		t.Fatalf("local package must depend directly on final review: %#v", localPackage.Dependencies)
 	}
 	resolved, err := StandardWorkflowTemplate().Compile(explicitProfile(catalog))
 	if err != nil {

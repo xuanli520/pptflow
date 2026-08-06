@@ -12,7 +12,7 @@ import (
 
 const productionPackageArchiveName = "harbor-factory-harbor-flow-production.tar.gz"
 
-func TestProductionPackageScriptBuildsThreeAttestedBundlesWithoutDiscoveryMaterial(t *testing.T) {
+func TestProductionPackageScriptBuildsStandardAuthoringBundleWithoutDiscoveryMaterial(t *testing.T) {
 	requireProductionPackageCommands(t)
 	fixture := newProductionPackageFixture(t)
 	outputs := filepath.Join(t.TempDir(), "outputs")
@@ -86,15 +86,15 @@ func TestProductionPackageScriptBuildsThreeAttestedBundlesWithoutDiscoveryMateri
 	assertNoPublishedOutputOrStaging(t, outputs, dirtyDuringBuild)
 }
 
-func TestProductionPackageScriptRequiresAllThreeCatalogLockPairs(t *testing.T) {
+func TestProductionPackageScriptRequiresStandardAuthoringCatalogLockPair(t *testing.T) {
 	requireProductionPackageCommands(t)
 	fixture := newProductionPackageFixture(t)
-	if err := os.Remove(filepath.Join(fixture.root, "deployments", "codeedge-phase1", "operation-catalog.lock.json")); err != nil {
+	if err := os.Remove(filepath.Join(fixture.root, "deployments", "standard-authoring", "operation-catalog.lock.json")); err != nil {
 		t.Fatal(err)
 	}
-	outputText, err := runProductionPackageResult(fixture, filepath.Join(t.TempDir(), "missing-parent-lock"), nil)
-	if err == nil || !strings.Contains(outputText, "CodeEdge Phase-1 lock must be a regular non-symlink file") {
-		t.Fatalf("missing parent lock error = %q, want explicit three-bundle lock rejection", outputText)
+	outputText, err := runProductionPackageResult(fixture, filepath.Join(t.TempDir(), "missing-standard-lock"), nil)
+	if err == nil || !strings.Contains(outputText, "Standard authoring lock must be a regular non-symlink file") {
+		t.Fatalf("missing standard lock error = %q, want explicit lock rejection", outputText)
 	}
 }
 
@@ -128,13 +128,6 @@ func newProductionPackageFixture(t *testing.T) productionPackageFixture {
 	writeProductionBundleFixture(t, root, "standard-authoring", []string{
 		"README.md", "operation-catalog.v1.json", "operation-catalog.lock.json", "contract-assets.v1.json", "execution-profile.v1.json",
 		"prompts/authoring-loop.json", "schemas/v3-agent-output.schema.json", "schemas/materialization-receipt.json",
-	})
-	writeProductionBundleFixture(t, root, "codeedge-phase1", []string{
-		"README.md", "operation-catalog.v1.json", "operation-catalog.lock.json",
-	})
-	writeProductionBundleFixture(t, root, "codeedge-evaluator-child", []string{
-		"README.md", "operation-catalog.v1.json", "operation-catalog.lock.json",
-		"candidates/README.md", "candidates/operation-inventory.discovery.v1.json",
 	})
 
 	fakeBin := filepath.Join(root, "fake-bin")
@@ -285,8 +278,6 @@ func assertUnifiedProductionBuildToolInvocation(t *testing.T, fixture production
 	for _, want := range []string{
 		"run -mod=readonly ./tools/harbor-flow-production-build",
 		"--standard-authoring-catalog ", "--standard-authoring-lock ",
-		"--codeedge-phase1-catalog ", "--codeedge-phase1-lock ",
-		"--codeedge-evaluator-catalog ", "--codeedge-evaluator-lock ",
 		"--source-manifest sha256:",
 	} {
 		if !strings.Contains(line, want) {
@@ -365,9 +356,6 @@ func assertUnifiedProductionPackage(t *testing.T, fixture productionPackageFixtu
 			t.Fatalf("archive contains forbidden non-production material %q:\n%s", forbidden, archiveContents)
 		}
 	}
-	if _, err := os.Stat(filepath.Join(output, "deployments", "codeedge-evaluator-child", "candidates")); !os.IsNotExist(err) {
-		t.Fatalf("candidate discovery directory was packaged: %v", err)
-	}
 	sourceAgentSchema, err := os.ReadFile(filepath.Join(fixture.root, "deployments", "standard-authoring", "schemas", "v3-agent-output.schema.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -384,12 +372,6 @@ func assertUnifiedProductionPackage(t *testing.T, fixture productionPackageFixtu
 func productionPackagePayloads() []string {
 	return []string{
 		"README.md",
-		"deployments/codeedge-evaluator-child/README.md",
-		"deployments/codeedge-evaluator-child/operation-catalog.lock.json",
-		"deployments/codeedge-evaluator-child/operation-catalog.v1.json",
-		"deployments/codeedge-phase1/README.md",
-		"deployments/codeedge-phase1/operation-catalog.lock.json",
-		"deployments/codeedge-phase1/operation-catalog.v1.json",
 		"deployments/standard-authoring/README.md",
 		"deployments/standard-authoring/contract-assets.v1.json",
 		"deployments/standard-authoring/execution-profile.v1.json",

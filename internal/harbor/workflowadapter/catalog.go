@@ -42,8 +42,6 @@ const (
 	StageQuality        StageGroup = "quality"
 	StageSimilarity     StageGroup = "similarity"
 	StageFinalReview    StageGroup = "final_review"
-	StageEvaluation     StageGroup = "evaluation"
-	StageSubmission     StageGroup = "submission"
 	StageDelivery       StageGroup = "delivery"
 )
 
@@ -56,8 +54,6 @@ var standardStageGroups = []StageGroup{
 	StageQuality,
 	StageSimilarity,
 	StageFinalReview,
-	StageEvaluation,
-	StageSubmission,
 	StageDelivery,
 }
 
@@ -86,15 +82,11 @@ const (
 	ReviewContent          ReviewKind = "content"
 	ReviewSolutionVerifier ReviewKind = "solution_verifier"
 	ReviewFinalQuality     ReviewKind = "final_quality"
-	// ReviewEvaluatorEvidence approves the immutable parent-to-child evidence
-	// handoff after the child evaluator Run has been independently verified.
-	ReviewEvaluatorEvidence ReviewKind = "evaluator_evidence_handoff"
-	ReviewModelResult       ReviewKind = "model_result"
 )
 
 func (kind ReviewKind) valid() bool {
 	switch kind {
-	case ReviewTaskDirection, ReviewContent, ReviewSolutionVerifier, ReviewFinalQuality, ReviewEvaluatorEvidence, ReviewModelResult:
+	case ReviewTaskDirection, ReviewContent, ReviewSolutionVerifier, ReviewFinalQuality:
 		return true
 	default:
 		return false
@@ -250,11 +242,7 @@ func StandardStageCatalog() StageCatalog {
 			stage(QualityCheck, StageQuality, []string{CodeEdgeLint}, "harborfactory.quality_check", []workflowkit.ResourceKey{resourceTaskSnapshot, resourceTaskDigest, resourceTaskTestsAnalysis, resourceEvidenceLint}, []workflowkit.ResourceKey{resourceEvidenceQuality}, workflowkit.EffectEvidenceOnly, 1, checkVerdicts(), artifactInput("task_snapshot"), artifactInput("tests_analysis"), artifactInput("lint_report"), artifactOutput("quality_report")),
 			stage(SimilarityCheck, StageSimilarity, []string{QualityCheck}, "harborfactory.similarity_check", []workflowkit.ResourceKey{resourceTaskSnapshot, resourceTaskDigest, resourceTaskTestsAnalysis, resourceEvidenceQuality}, []workflowkit.ResourceKey{resourceEvidenceSimilarity}, workflowkit.EffectEvidenceOnly, 1, similarityVerdicts(), artifactInput("task_snapshot"), artifactInput("quality_report"), artifactOutput("similarity_report")),
 			gateStage(FinalReview, StageFinalReview, []string{SimilarityCheck}, ReviewFinalQuality, []workflowkit.ResourceKey{resourceTaskDigest, resourceEvidenceVerification, resourceEvidenceLint, resourceEvidenceQuality, resourceEvidenceSimilarity}, []workflowkit.ResourceKey{resourceReviewFinalQuality}, artifactInput("lint_report"), artifactInput("verify_report"), artifactInput("quality_report"), artifactInput("similarity_report")),
-			stage(HarborRunQwen, StageEvaluation, []string{FinalReview}, "harborfactory.harbor_run_qwen", []workflowkit.ResourceKey{resourceTaskSnapshot, resourceTaskDigest, resourceReviewFinalQuality}, []workflowkit.ResourceKey{resourceEvidenceEvaluationQwen}, workflowkit.EffectEvidenceOnly, 1, evaluationVerdicts(), artifactInput("task_snapshot"), reviewDecisionInput("final_review_decision"), artifactOutput("qwen_trial_result"), artifactOutput("qwen_pass4_evidence")),
-			stage(HarborRunOpus, StageEvaluation, []string{FinalReview}, "harborfactory.harbor_run_opus", []workflowkit.ResourceKey{resourceTaskSnapshot, resourceTaskDigest, resourceReviewFinalQuality}, []workflowkit.ResourceKey{resourceEvidenceEvaluationOpus}, workflowkit.EffectEvidenceOnly, 1, evaluationVerdicts(), artifactInput("task_snapshot"), reviewDecisionInput("final_review_decision"), artifactOutput("opus_trial_result"), artifactOutput("opus_pass4_evidence")),
-			gateStage(ResultReview, StageSubmission, []string{HarborRunQwen, HarborRunOpus}, ReviewModelResult, []workflowkit.ResourceKey{resourceTaskDigest, resourceReviewFinalQuality, resourceEvidenceEvaluationQwen, resourceEvidenceEvaluationOpus}, []workflowkit.ResourceKey{resourceReviewModelResult}, artifactInput("qwen_trial_result"), artifactInput("opus_trial_result")),
-			stage(SubmissionLint, StageSubmission, []string{ResultReview}, "harborfactory.codeedge_lint", []workflowkit.ResourceKey{resourceTaskSnapshot, resourceTaskDigest, resourceTaskTestsAnalysis, resourceReviewModelResult, resourceEvidenceEvaluationQwen, resourceEvidenceEvaluationOpus}, []workflowkit.ResourceKey{resourceEvidenceSubmissionLint}, workflowkit.EffectEvidenceOnly, 1, checkVerdicts(), artifactInput("task_snapshot"), artifactInput("tests_analysis"), reviewDecisionInput("model_result_decision"), artifactOutput("submission_lint_report")),
-			operatorOnlyLocalPackageStage([]string{SubmissionLint}, []workflowkit.ResourceKey{resourceTaskSnapshot, resourceTaskDigest, resourceEvidenceSubmissionLint}, []workflowkit.ResourceKey{resourceDeliveryPackage}, artifactInput("task_snapshot"), artifactInput("submission_lint_report"), artifactOutput("package_bundle")),
+			operatorOnlyLocalPackageStage([]string{FinalReview}, []workflowkit.ResourceKey{resourceTaskSnapshot, resourceTaskDigest, resourceReviewFinalQuality}, []workflowkit.ResourceKey{resourceDeliveryPackage}, artifactInput("task_snapshot"), reviewDecisionInput("final_review_decision"), artifactOutput("package_bundle")),
 		},
 	}
 }
@@ -357,10 +345,6 @@ func reviewDecisionArtifact(kind ReviewKind) workflowkit.ArtifactSpec {
 		name = "solution_review_decision"
 	case ReviewFinalQuality:
 		name = "final_review_decision"
-	case ReviewEvaluatorEvidence:
-		name = "evaluator_evidence_handoff_decision"
-	case ReviewModelResult:
-		name = "model_result_decision"
 	}
 	return workflowkit.ArtifactSpec{Name: name, SchemaVersion: "harbor.review-decision.v1", Required: true}
 }
@@ -405,10 +389,6 @@ func similarityVerdicts() workflowkit.VerdictPolicy {
 
 func gateVerdicts() workflowkit.VerdictPolicy {
 	return workflowkit.VerdictPolicy{Allowed: []workflowkit.Verdict{workflowkit.VerdictPass, workflowkit.VerdictNeedsRepair, workflowkit.VerdictReject}}
-}
-
-func evaluationVerdicts() workflowkit.VerdictPolicy {
-	return workflowkit.VerdictPolicy{Allowed: []workflowkit.Verdict{workflowkit.VerdictPass, workflowkit.VerdictNeedsRepair, workflowkit.VerdictAdvisory}}
 }
 
 func deliveryVerdicts() workflowkit.VerdictPolicy {
@@ -621,7 +601,6 @@ func validateGateCoverage(actual map[workflowkit.StageKey]struct{}) error {
 		workflowkit.StageKey(ContentReview),
 		workflowkit.StageKey(SolutionReview),
 		workflowkit.StageKey(FinalReview),
-		workflowkit.StageKey(ResultReview),
 	})
 }
 
@@ -858,8 +837,6 @@ const (
 	resourceReviewContent                   workflowkit.ResourceKey = "review/content"
 	resourceReviewSolutionVerifier          workflowkit.ResourceKey = "review/solution-verifier"
 	resourceReviewFinalQuality              workflowkit.ResourceKey = "review/final-quality"
-	resourceReviewEvaluatorEvidence         workflowkit.ResourceKey = "review/evaluator-evidence-handoff"
-	resourceReviewModelResult               workflowkit.ResourceKey = "review/model-result"
 	resourceEvidenceRepoPrepare             workflowkit.ResourceKey = "evidence/repo-prepare"
 	resourceEvidenceAuthoringDockerBuild    workflowkit.ResourceKey = "evidence/authoring/dockerfile-build"
 	resourceEvidenceAuthoringHarness        workflowkit.ResourceKey = "evidence/authoring/harness"
@@ -876,10 +853,7 @@ const (
 	resourceEvidenceLint                    workflowkit.ResourceKey = "evidence/lint"
 	resourceEvidenceQuality                 workflowkit.ResourceKey = "evidence/quality"
 	resourceEvidenceSimilarity              workflowkit.ResourceKey = "evidence/similarity"
-	resourceEvidenceEvaluationQwen          workflowkit.ResourceKey = "evidence/evaluation/qwen"
-	resourceEvidenceEvaluationOpus          workflowkit.ResourceKey = "evidence/evaluation/opus"
 	resourceEvidenceEvaluatorHandoff        workflowkit.ResourceKey = "evidence/evaluation/handoff"
-	resourceEvidenceSubmissionLint          workflowkit.ResourceKey = "evidence/submission-lint"
 	resourceDeliveryPublish                 workflowkit.ResourceKey = "delivery/publish"
 	resourceDeliveryPackage                 workflowkit.ResourceKey = "delivery/package"
 )

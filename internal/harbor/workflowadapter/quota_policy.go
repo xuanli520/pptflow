@@ -18,8 +18,7 @@ const (
 	StandardQuotaPolicyVersion = "1.0.0"
 
 	// StandardAuthoringQuotaPolicyID and Version identify the bounded 3.0
-	// source-session authoring policy. Task-bound verification and packaging
-	// quota begins only in the child CodeEdge Run after materialization.
+	// source-session authoring policy.
 	StandardAuthoringQuotaPolicyID              = "harbor.standard-authoring.local.operator"
 	StandardAuthoringContractQuotaPolicyVersion = "3.1.0"
 	StandardAuthoringValidationQuotaDimension   = "authoring_validation"
@@ -36,20 +35,6 @@ const (
 	// submissions.
 	StandardAuthoringValidationClaimUnits int64 = 8
 
-	// CodeEdgePhase1QuotaPolicyID and Version identify the explicit quota
-	// policy for the closed Phase-1 compliance descriptor. It is separate from
-	// Standard because Phase-1 has no implicit authoring or repair stage budget.
-	// The separately launched evaluator child owns every Qwen/Opus trial
-	// reservation, while the parent only owns the durable handoff gate.
-	CodeEdgePhase1QuotaPolicyID      = "harbor.codeedge-phase1.local.operator"
-	CodeEdgePhase1QuotaPolicyVersion = "2.0.0"
-
-	// CodeEdgeEvaluatorChildQuotaPolicyID and Version identify the quota
-	// envelope for the two-stage CodeEdge evaluator child. Its only billable
-	// work is Qwen and Opus, each of which owns exactly four logical trials.
-	CodeEdgeEvaluatorChildQuotaPolicyID      = "harbor.codeedge-evaluator.local.operator"
-	CodeEdgeEvaluatorChildQuotaPolicyVersion = "1.0.0"
-
 	standardTaskStageAttemptLimit         int64 = 120
 	standardActorStageAttemptLimit        int64 = 1200
 	standardTaskAgentTurnLimit            int64 = 64
@@ -65,7 +50,6 @@ const (
 	standardAuthoringCandidateRepairLimit int64 = 8
 
 	standardStageAttemptClaimUnits int64 = 1
-	standardEvaluationTrialClaims  int64 = 4
 	standardRepairRoundClaimUnits  int64 = 1
 )
 
@@ -426,59 +410,6 @@ func StandardAuthoringContractQuotaPolicy() QuotaPolicy {
 	}
 }
 
-// CodeEdgePhase1QuotaPolicy returns the explicit resource policy for the
-// closed CodeEdge Phase-1 template. It intentionally contains no agent-turn
-// repair-round or trial account: this descriptor validates an already frozen
-// task snapshot and adopts child evidence. The evaluator child alone reserves
-// four logical trials per model.
-func CodeEdgePhase1QuotaPolicy() QuotaPolicy {
-	catalog := CodeEdgePhase1StageCatalog()
-	stages := make([]StageQuotaPolicy, 0, len(catalog.Stages))
-	for _, stage := range catalog.Stages {
-		claims := []workflowkit.QuotaClaim{standardQuotaClaim("stage_attempt", standardStageAttemptClaimUnits)}
-		if stage.IsGate() {
-			claims = []workflowkit.QuotaClaim{}
-		}
-		stages = append(stages, StageQuotaPolicy{StageKey: stage.Key, Claims: claims})
-	}
-	return QuotaPolicy{
-		ID:      CodeEdgePhase1QuotaPolicyID,
-		Version: CodeEdgePhase1QuotaPolicyVersion,
-		AccountLimits: []QuotaAccountLimit{{
-			Dimension: "stage_attempt", TaskLimitUnits: standardTaskStageAttemptLimit, ActorLimitUnits: standardActorStageAttemptLimit,
-		}},
-		Stages: stages,
-	}
-}
-
-// CodeEdgeEvaluatorChildQuotaPolicy reserves the complete evaluator charge at
-// Run admission: two stage attempts and eight logical trials. The account
-// limits remain intentionally broader than one Run so the durable quota model
-// can account for concurrent task/actor work; the closed template itself has
-// no node capable of creating additional trials.
-func CodeEdgeEvaluatorChildQuotaPolicy() QuotaPolicy {
-	catalog := CodeEdgeEvaluatorChildStageCatalog()
-	stages := make([]StageQuotaPolicy, 0, len(catalog.Stages))
-	for _, stage := range catalog.Stages {
-		stages = append(stages, StageQuotaPolicy{
-			StageKey: stage.Key,
-			Claims: []workflowkit.QuotaClaim{
-				standardQuotaClaim("stage_attempt", standardStageAttemptClaimUnits),
-				standardQuotaClaim("trial", standardEvaluationTrialClaims),
-			},
-		})
-	}
-	return QuotaPolicy{
-		ID:      CodeEdgeEvaluatorChildQuotaPolicyID,
-		Version: CodeEdgeEvaluatorChildQuotaPolicyVersion,
-		AccountLimits: []QuotaAccountLimit{
-			{Dimension: "stage_attempt", TaskLimitUnits: standardTaskStageAttemptLimit, ActorLimitUnits: standardActorStageAttemptLimit},
-			{Dimension: "trial", TaskLimitUnits: standardTaskTrialLimit, ActorLimitUnits: standardActorTrialLimit},
-		},
-		Stages: stages,
-	}
-}
-
 func standardClaimsForStage(stage StageDefinition) []workflowkit.QuotaClaim {
 	if stage.IsGate() {
 		return []workflowkit.QuotaClaim{}
@@ -488,8 +419,6 @@ func standardClaimsForStage(stage StageDefinition) []workflowkit.QuotaClaim {
 		claims = append(claims, standardQuotaClaim("agent_turn", int64(stage.RequiredTurns)))
 	}
 	switch stage.Key {
-	case workflowkit.StageKey(HarborRunQwen), workflowkit.StageKey(HarborRunOpus):
-		claims = append(claims, standardQuotaClaim("trial", standardEvaluationTrialClaims))
 	case workflowkit.StageKey(TaskRepair):
 		claims = append(claims, standardQuotaClaim("repair_round", standardRepairRoundClaimUnits))
 	}

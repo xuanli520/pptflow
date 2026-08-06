@@ -314,81 +314,6 @@ CREATE TABLE change_operations_v8 (
     UNIQUE(candidate_id, operation_key)
 );
 
--- table codeedge_compliance_records_v20
-CREATE TABLE codeedge_compliance_records_v20 (
-    id                        TEXT PRIMARY KEY,
-    run_id                    TEXT NOT NULL UNIQUE REFERENCES workflow_runs(id) ON DELETE RESTRICT,
-    task_id                   TEXT NOT NULL REFERENCES tasks_v2(id) ON DELETE RESTRICT,
-    revision_id               TEXT NOT NULL REFERENCES task_revisions(id) ON DELETE RESTRICT,
-    task_digest               TEXT NOT NULL,
-    status                    TEXT NOT NULL CHECK (status IN ('approved', 'rejected')),
-    evaluator_evidence_handoff_id TEXT NOT NULL UNIQUE REFERENCES codeedge_evaluator_evidence_handoffs_v2(id) ON DELETE RESTRICT,
-    evaluator_evidence_handoff_fingerprint TEXT NOT NULL,
-    qwen_receipt_json         TEXT NOT NULL,
-    opus_receipt_json         TEXT NOT NULL,
-    submission_receipt_json   TEXT NOT NULL,
-    decision_json             TEXT NOT NULL,
-    decision_fingerprint      TEXT NOT NULL,
-    authorization_json        TEXT NOT NULL DEFAULT '',
-    authorization_fingerprint TEXT NOT NULL DEFAULT '',
-    idempotency_key           TEXT NOT NULL UNIQUE,
-    created_by                TEXT NOT NULL,
-    created_at                DATETIME NOT NULL,
-    CHECK (
-        (status = 'approved' AND length(authorization_json) > 0 AND length(authorization_fingerprint) > 0)
-        OR
-        (status = 'rejected' AND authorization_json = '' AND authorization_fingerprint = '')
-    )
-);
-
--- table codeedge_evaluator_evidence_handoffs_v2
--- The parent CodeEdge Phase-1 Run remains the only compliance/package owner.
--- This immutable record links it to the closed evaluator child Run without
--- copying or re-labelling the child-owned Harbor evidence.
-CREATE TABLE codeedge_evaluator_evidence_handoffs_v2 (
-    id                                TEXT PRIMARY KEY,
-    parent_run_id                     TEXT NOT NULL UNIQUE REFERENCES workflow_runs(id) ON DELETE RESTRICT,
-    child_run_id                      TEXT NOT NULL UNIQUE REFERENCES workflow_runs(id) ON DELETE RESTRICT,
-    task_id                           TEXT NOT NULL REFERENCES tasks_v2(id) ON DELETE RESTRICT,
-    revision_id                       TEXT NOT NULL REFERENCES task_revisions(id) ON DELETE RESTRICT,
-    task_digest                       TEXT NOT NULL,
-    parent_catalog_fingerprint        TEXT NOT NULL,
-    parent_lock_fingerprint           TEXT NOT NULL,
-    parent_manifest_fingerprint       TEXT NOT NULL,
-    parent_definition_fingerprint     TEXT NOT NULL,
-    child_catalog_fingerprint         TEXT NOT NULL,
-    child_lock_fingerprint            TEXT NOT NULL,
-    child_manifest_fingerprint        TEXT NOT NULL,
-    child_definition_fingerprint      TEXT NOT NULL,
-    qwen_stage_attempt_id             TEXT NOT NULL UNIQUE REFERENCES stage_attempts(id) ON DELETE RESTRICT,
-    qwen_bundle_artifact_id           TEXT NOT NULL UNIQUE REFERENCES artifact_refs_v4(id) ON DELETE RESTRICT,
-    qwen_bundle_content_digest        TEXT NOT NULL,
-    qwen_bundle_schema_version        TEXT NOT NULL,
-    qwen_screenshot_artifact_id       TEXT NOT NULL UNIQUE REFERENCES artifact_refs_v4(id) ON DELETE RESTRICT,
-    qwen_screenshot_content_digest    TEXT NOT NULL,
-    qwen_screenshot_schema_version    TEXT NOT NULL,
-    qwen_trial_set_fingerprint        TEXT NOT NULL,
-    opus_stage_attempt_id             TEXT NOT NULL UNIQUE REFERENCES stage_attempts(id) ON DELETE RESTRICT,
-    opus_bundle_artifact_id           TEXT NOT NULL UNIQUE REFERENCES artifact_refs_v4(id) ON DELETE RESTRICT,
-    opus_bundle_content_digest        TEXT NOT NULL,
-    opus_bundle_schema_version        TEXT NOT NULL,
-    opus_screenshot_artifact_id       TEXT NOT NULL UNIQUE REFERENCES artifact_refs_v4(id) ON DELETE RESTRICT,
-    opus_screenshot_content_digest    TEXT NOT NULL,
-    opus_screenshot_schema_version    TEXT NOT NULL,
-    opus_trial_set_fingerprint        TEXT NOT NULL,
-    handoff_json                      TEXT NOT NULL,
-    handoff_fingerprint               TEXT NOT NULL,
-    idempotency_key                   TEXT NOT NULL UNIQUE,
-    created_by                        TEXT NOT NULL,
-    created_at                        DATETIME NOT NULL,
-    CHECK (parent_run_id <> child_run_id),
-    CHECK (qwen_stage_attempt_id <> opus_stage_attempt_id),
-    CHECK (qwen_bundle_artifact_id <> qwen_screenshot_artifact_id),
-    CHECK (opus_bundle_artifact_id <> opus_screenshot_artifact_id),
-    CHECK (qwen_bundle_artifact_id <> opus_bundle_artifact_id),
-    CHECK (qwen_screenshot_artifact_id <> opus_screenshot_artifact_id)
-);
-
 -- table continuation_commands_v4
 CREATE TABLE continuation_commands_v4 (
     id             TEXT PRIMARY KEY,
@@ -1256,34 +1181,6 @@ CREATE TABLE authoring_task_materializations_v2 (
     CHECK (substr(request_fingerprint, 8) NOT GLOB '*[^0-9a-f]*')
 );
 
--- table authoring_phase1_handoffs_v2
--- This is the second, separately durable bridge: a persisted
--- authoring_task_handoff artifact may prepare exactly one task-bound
--- CodeEdge Phase-1 child Run. It reserves the child identity before Run
--- creation, while the application layer verifies the artifact's strict JSON
--- content and object bytes before inserting this row.
-CREATE TABLE authoring_phase1_handoffs_v2 (
-    id                    TEXT PRIMARY KEY,
-    authoring_run_id      TEXT NOT NULL UNIQUE REFERENCES workflow_runs(id) ON DELETE RESTRICT,
-    authoring_session_id  TEXT NOT NULL REFERENCES authoring_sessions_v2(id) ON DELETE RESTRICT,
-    authoring_source_id   TEXT NOT NULL REFERENCES authoring_sources_v2(id) ON DELETE RESTRICT,
-    handoff_artifact_id   TEXT NOT NULL UNIQUE REFERENCES artifact_refs_v4(id) ON DELETE RESTRICT,
-    handoff_fingerprint   TEXT NOT NULL UNIQUE,
-    task_id               TEXT NOT NULL REFERENCES tasks_v2(id) ON DELETE RESTRICT,
-    revision_id           TEXT NOT NULL REFERENCES task_revisions(id) ON DELETE RESTRICT,
-    task_digest           TEXT NOT NULL,
-    child_run_id          TEXT NOT NULL UNIQUE,
-    idempotency_key       TEXT NOT NULL UNIQUE,
-    created_by            TEXT NOT NULL,
-    created_at            DATETIME NOT NULL,
-    CHECK (length(handoff_fingerprint) = 71),
-    CHECK (substr(handoff_fingerprint, 1, 7) = 'sha256:'),
-    CHECK (substr(handoff_fingerprint, 8) NOT GLOB '*[^0-9a-f]*'),
-    CHECK (length(task_digest) = 86),
-    CHECK (substr(task_digest, 1, 22) = 'harbor.task.v2:sha256:'),
-    CHECK (substr(task_digest, 23) NOT GLOB '*[^0-9a-f]*')
-);
-
 -- table tasks_v2
 CREATE TABLE "tasks_v2" (
     id                  TEXT PRIMARY KEY,
@@ -1479,10 +1376,6 @@ CREATE INDEX idx_authoring_task_materializations_v2_revision
 CREATE INDEX idx_authoring_task_materializations_v2_run
     ON authoring_task_materializations_v2(authoring_run_id);
 
--- index idx_authoring_phase1_handoffs_v2_task
-CREATE INDEX idx_authoring_phase1_handoffs_v2_task
-    ON authoring_phase1_handoffs_v2(task_id, revision_id, created_at DESC, id);
-
 -- index idx_run_input_artifacts_run_port
 CREATE INDEX idx_run_input_artifacts_run_port
     ON run_input_artifacts(run_id, port);
@@ -1508,18 +1401,6 @@ CREATE INDEX idx_change_operations_v8_candidate
 -- index idx_change_operations_v8_state
 CREATE INDEX idx_change_operations_v8_state
     ON change_operations_v8(state, updated_at);
-
--- index idx_codeedge_compliance_v20_revision
-CREATE INDEX idx_codeedge_compliance_v20_revision
-    ON codeedge_compliance_records_v20(revision_id, created_at, id);
-
--- index idx_codeedge_compliance_v20_task
-CREATE INDEX idx_codeedge_compliance_v20_task
-    ON codeedge_compliance_records_v20(task_id, created_at, id);
-
--- index idx_codeedge_evaluator_handoff_v2_task
-CREATE INDEX idx_codeedge_evaluator_handoff_v2_task
-    ON codeedge_evaluator_evidence_handoffs_v2(task_id, revision_id, created_at, id);
 
 -- index idx_continuation_commands_v4_subject
 CREATE INDEX idx_continuation_commands_v4_subject
@@ -1809,15 +1690,6 @@ CREATE UNIQUE INDEX idx_workflow_runs_authoring_session
     ON workflow_runs(authoring_session_id)
     WHERE authoring_session_id IS NOT NULL;
 
--- index idx_workflow_runs_codeedge_evaluator_parent
--- A Phase-1 parent has one canonical evaluator child. This durable boundary
--- prevents a second Qwen/Opus trial set from being created by a concurrent or
--- direct lifecycle caller with a different idempotency key.
-CREATE UNIQUE INDEX idx_workflow_runs_codeedge_evaluator_parent
-    ON workflow_runs(parent_run_id)
-    WHERE parent_run_id IS NOT NULL
-      AND workflow_template_id = 'harbor.codeedge-evaluator';
-
 -- index idx_workflow_runs_status
 CREATE INDEX idx_workflow_runs_status ON workflow_runs(status);
 
@@ -2030,34 +1902,6 @@ BEGIN
     SELECT RAISE(ABORT, 'audit events are append-only');
 END;
 
--- trigger codeedge_compliance_records_v20_immutable
-CREATE TRIGGER codeedge_compliance_records_v20_immutable
-BEFORE UPDATE ON codeedge_compliance_records_v20
-BEGIN
-    SELECT RAISE(ABORT, 'CodeEdge compliance record is immutable');
-END;
-
--- trigger codeedge_compliance_records_v20_no_delete
-CREATE TRIGGER codeedge_compliance_records_v20_no_delete
-BEFORE DELETE ON codeedge_compliance_records_v20
-BEGIN
-    SELECT RAISE(ABORT, 'CodeEdge compliance records are append-only');
-END;
-
--- trigger codeedge_evaluator_evidence_handoffs_v2_immutable
-CREATE TRIGGER codeedge_evaluator_evidence_handoffs_v2_immutable
-BEFORE UPDATE ON codeedge_evaluator_evidence_handoffs_v2
-BEGIN
-    SELECT RAISE(ABORT, 'CodeEdge evaluator evidence handoff is immutable');
-END;
-
--- trigger codeedge_evaluator_evidence_handoffs_v2_no_delete
-CREATE TRIGGER codeedge_evaluator_evidence_handoffs_v2_no_delete
-BEFORE DELETE ON codeedge_evaluator_evidence_handoffs_v2
-BEGIN
-    SELECT RAISE(ABORT, 'CodeEdge evaluator evidence handoffs are append-only');
-END;
-
 -- trigger continuation_commands_v4_no_delete
 CREATE TRIGGER continuation_commands_v4_no_delete
 BEFORE DELETE ON continuation_commands_v4
@@ -2193,24 +2037,6 @@ BEGIN
         THEN RAISE(ABORT, 'global entity identity collision')
     END;
     INSERT INTO entity_id_registry (id, entity_type) VALUES (NEW.id, 'authoring_task_materialization');
-END;
-
--- trigger entity_id_registry_authoring_phase1_handoffs_v2_id_immutable
-CREATE TRIGGER entity_id_registry_authoring_phase1_handoffs_v2_id_immutable
-BEFORE UPDATE OF id ON authoring_phase1_handoffs_v2
-WHEN NEW.id <> OLD.id
-BEGIN
-    SELECT RAISE(ABORT, 'lifecycle entity identity is immutable');
-END;
-
--- trigger entity_id_registry_authoring_phase1_handoffs_v2_insert
-CREATE TRIGGER entity_id_registry_authoring_phase1_handoffs_v2_insert
-BEFORE INSERT ON authoring_phase1_handoffs_v2
-BEGIN
-    SELECT CASE WHEN EXISTS (SELECT 1 FROM entity_id_registry WHERE id = NEW.id)
-        THEN RAISE(ABORT, 'global entity identity collision')
-    END;
-    INSERT INTO entity_id_registry (id, entity_type) VALUES (NEW.id, 'authoring_phase1_handoff');
 END;
 
 -- trigger entity_id_registry_authoring_run_input_artifacts_v2_id_immutable
@@ -2481,42 +2307,6 @@ BEGIN
         THEN RAISE(ABORT, 'global entity identity collision')
     END;
     INSERT INTO entity_id_registry (id, entity_type) VALUES (NEW.id, 'change_operation');
-END;
-
--- trigger entity_id_registry_codeedge_compliance_records_v20_id_immutable
-CREATE TRIGGER entity_id_registry_codeedge_compliance_records_v20_id_immutable
-BEFORE UPDATE OF id ON codeedge_compliance_records_v20
-WHEN NEW.id <> OLD.id
-BEGIN
-    SELECT RAISE(ABORT, 'lifecycle entity identity is immutable');
-END;
-
--- trigger entity_id_registry_codeedge_compliance_records_v20_insert
-CREATE TRIGGER entity_id_registry_codeedge_compliance_records_v20_insert
-BEFORE INSERT ON codeedge_compliance_records_v20
-BEGIN
-    SELECT CASE WHEN EXISTS (SELECT 1 FROM entity_id_registry WHERE id = NEW.id)
-        THEN RAISE(ABORT, 'global entity identity collision')
-    END;
-    INSERT INTO entity_id_registry (id, entity_type) VALUES (NEW.id, 'codeedge_compliance_record');
-END;
-
--- trigger entity_id_registry_codeedge_evaluator_evidence_handoffs_v2_id_immutable
-CREATE TRIGGER entity_id_registry_codeedge_evaluator_evidence_handoffs_v2_id_immutable
-BEFORE UPDATE OF id ON codeedge_evaluator_evidence_handoffs_v2
-WHEN NEW.id <> OLD.id
-BEGIN
-    SELECT RAISE(ABORT, 'lifecycle entity identity is immutable');
-END;
-
--- trigger entity_id_registry_codeedge_evaluator_evidence_handoffs_v2_insert
-CREATE TRIGGER entity_id_registry_codeedge_evaluator_evidence_handoffs_v2_insert
-BEFORE INSERT ON codeedge_evaluator_evidence_handoffs_v2
-BEGIN
-    SELECT CASE WHEN EXISTS (SELECT 1 FROM entity_id_registry WHERE id = NEW.id)
-        THEN RAISE(ABORT, 'global entity identity collision')
-    END;
-    INSERT INTO entity_id_registry (id, entity_type) VALUES (NEW.id, 'codeedge_evaluator_evidence_handoff');
 END;
 
 -- trigger entity_id_registry_continuation_commands_v4_id_immutable
@@ -3521,20 +3311,6 @@ BEGIN
     SELECT RAISE(ABORT, 'authoring task materializations are immutable');
 END;
 
--- trigger authoring_phase1_handoffs_v2_immutable
-CREATE TRIGGER authoring_phase1_handoffs_v2_immutable
-BEFORE UPDATE ON authoring_phase1_handoffs_v2
-BEGIN
-    SELECT RAISE(ABORT, 'authoring Phase-1 handoffs are immutable');
-END;
-
--- trigger authoring_phase1_handoffs_v2_no_delete
-CREATE TRIGGER authoring_phase1_handoffs_v2_no_delete
-BEFORE DELETE ON authoring_phase1_handoffs_v2
-BEGIN
-    SELECT RAISE(ABORT, 'authoring Phase-1 handoffs are immutable');
-END;
-
 -- trigger authoring_run_input_artifacts_v2_immutable
 CREATE TRIGGER authoring_run_input_artifacts_v2_immutable
 BEFORE UPDATE ON authoring_run_input_artifacts_v2
@@ -3781,56 +3557,6 @@ WHEN NOT EXISTS (
 )
 BEGIN
     SELECT RAISE(ABORT, 'authoring task materialization does not match frozen session/run/source lineage');
-END;
-
--- trigger authoring_phase1_handoffs_v2_binding_insert
--- The Store cannot parse the handoff object bytes, but it still proves every
--- relational fact around that artifact: it must be the unique completed
--- materialize_task output of the same source/session Run and the one sealed
--- generated revision recorded by authoring_task_materializations_v2.
-CREATE TRIGGER authoring_phase1_handoffs_v2_binding_insert
-BEFORE INSERT ON authoring_phase1_handoffs_v2
-WHEN NOT EXISTS (
-    SELECT 1
-    FROM workflow_runs AS run
-    JOIN authoring_sessions_v2 AS session ON session.id = run.authoring_session_id
-    JOIN authoring_sources_v2 AS source ON source.id = session.source_id
-    JOIN authoring_task_materializations_v2 AS materialization ON materialization.authoring_run_id = run.id
-    JOIN task_revisions AS revision ON revision.id = materialization.revision_id
-    JOIN artifact_refs_v4 AS artifact ON artifact.id = NEW.handoff_artifact_id
-    JOIN stage_attempts AS attempt ON attempt.id = artifact.attempt_id
-    WHERE run.id = NEW.authoring_run_id
-      AND run.subject_kind = 'authoring_session'
-      AND run.workflow_template_id = 'harbor.standard-authoring'
-      AND run.workflow_template_version = '2.0.0'
-      AND artifact.schema_version = 'harbor.authoring-task-handoff.v2'
-      AND run.authoring_session_id = NEW.authoring_session_id
-      AND run.subject_id = NEW.authoring_source_id
-      AND run.subject_revision_id = NEW.authoring_session_id
-      AND session.source_id = NEW.authoring_source_id
-      AND session.target_task_id = NEW.task_id
-      AND materialization.session_id = NEW.authoring_session_id
-      AND materialization.source_id = NEW.authoring_source_id
-      AND materialization.task_id = NEW.task_id
-      AND materialization.revision_id = NEW.revision_id
-      AND materialization.task_digest = NEW.task_digest
-      AND revision.task_id = NEW.task_id
-      AND revision.task_digest = NEW.task_digest
-      AND revision.origin = 'generated'
-      AND revision.state = 'sealed'
-      AND artifact.run_id = run.id
-      AND artifact.stage_key = 'materialize_task'
-      AND artifact.artifact_key = 'authoring_task_handoff'
-      AND artifact.subject_revision_id = NEW.authoring_session_id
-      AND artifact.subject_digest = source.snapshot_content_digest
-      AND attempt.run_id = run.id
-      AND attempt.id = artifact.attempt_id
-      AND attempt.stage_key = 'materialize_task'
-      AND attempt.execution_status = 'completed'
-      AND attempt.verdict IN ('pass', 'advisory')
-)
-BEGIN
-    SELECT RAISE(ABORT, 'authoring Phase-1 handoff does not match persisted materialization lineage');
 END;
 
 -- trigger workflow_runs_content_immutable

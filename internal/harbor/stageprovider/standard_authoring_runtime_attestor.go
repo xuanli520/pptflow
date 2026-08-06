@@ -26,6 +26,13 @@ const (
 	// does not approve an image: a task-specific image policy remains a
 	// separate immutable handler contract.
 	StandardAuthoringDockerCommandID = "standard-authoring.docker"
+	// StandardAuthoringDockerBuildCommandID, StandardAuthoringInitialVerifyCommandID,
+	// and StandardAuthoringOracleVerifyCommandID are the three controlled
+	// Docker-dependent verification commands used by the Standard authoring
+	// candidate harness.
+	StandardAuthoringDockerBuildCommandID   = "standard-authoring.docker-build"
+	StandardAuthoringInitialVerifyCommandID = "standard-authoring.initial-verify"
+	StandardAuthoringOracleVerifyCommandID  = "standard-authoring.oracle-verify"
 
 	standardAuthoringHostProbeTimeout     = 15 * time.Second
 	standardAuthoringHostProbeOutputLimit = 64 * 1024

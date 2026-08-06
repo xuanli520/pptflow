@@ -12,8 +12,6 @@ README.md
 harbor-factory
 deployments/
   standard-authoring/
-  codeedge-phase1/
-  codeedge-evaluator-child/
 SHA256SUMS
 harbor-factory-harbor-flow-production.tar.gz
 ```

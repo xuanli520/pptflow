@@ -2,8 +2,7 @@
 set -euo pipefail
 
 # Build the local, immutable Harbor Flow production package. The package binds
-# three independent closed templates: Standard authoring, the CodeEdge Phase-1
-# parent, and the CodeEdge evaluator child. It intentionally reads neither
+# the Standard authoring closed template. It intentionally reads neither
 # provider endpoints nor credentials.
 #
 # Every catalog/lock pair is copied into a private staging directory before it
@@ -120,19 +119,11 @@ esac
 
 standard_catalog="$root/deployments/standard-authoring/operation-catalog.v1.json"
 standard_lock="$root/deployments/standard-authoring/operation-catalog.lock.json"
-parent_catalog="$root/deployments/codeedge-phase1/operation-catalog.v1.json"
-parent_lock="$root/deployments/codeedge-phase1/operation-catalog.lock.json"
-evaluator_catalog="$root/deployments/codeedge-evaluator-child/operation-catalog.v1.json"
-evaluator_lock="$root/deployments/codeedge-evaluator-child/operation-catalog.lock.json"
 production_package_readme="$root/docs/PRODUCTION_PACKAGE.md"
 
 for entry in \
   "Standard authoring catalog:$standard_catalog" \
   "Standard authoring lock:$standard_lock" \
-  "CodeEdge Phase-1 catalog:$parent_catalog" \
-  "CodeEdge Phase-1 lock:$parent_lock" \
-  "CodeEdge evaluator child catalog:$evaluator_catalog" \
-  "CodeEdge evaluator child lock:$evaluator_lock" \
   "Production package README:$production_package_readme"; do
   require_regular_file "${entry%%:*}" "${entry#*:}"
 done
@@ -144,9 +135,9 @@ if [[ ! "$source_epoch" =~ ^[0-9]+$ ]]; then
 fi
 export SOURCE_DATE_EPOCH="$source_epoch"
 
-# Every generated lock is omitted from the tree manifest. A lock carries this
-# digest itself, so including any one of the three would create a hash cycle.
-source_manifest="sha256:$(git -C "$root" ls-tree -r --full-tree "$source_commit" | LC_ALL=C awk -F '\t' '$2 != "deployments/standard-authoring/operation-catalog.lock.json" && $2 != "deployments/codeedge-phase1/operation-catalog.lock.json" && $2 != "deployments/codeedge-evaluator-child/operation-catalog.lock.json" { print $0 }' | sha256sum | awk '{print $1}')"
+# The generated lock is omitted from the tree manifest. A lock carries this
+# digest itself, so including it would create a hash cycle.
+source_manifest="sha256:$(git -C "$root" ls-tree -r --full-tree "$source_commit" | LC_ALL=C awk -F '\t' '$2 != "deployments/standard-authoring/operation-catalog.lock.json" { print $0 }' | sha256sum | awk '{print $1}')"
 
 workdir="$(mktemp -d "$output_parent/.harbor-flow-production.XXXXXX")"
 inputs="$workdir/inputs"
@@ -156,28 +147,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# The evaluator's candidates/ subtree is retained in source only as a
-# non-authoritative discovery record. It is deliberately excluded here rather
-# than treated as an input or copied into the release package.
 copy_deployment_tree "Standard authoring" "$root/deployments/standard-authoring" "$inputs/deployments/standard-authoring" 0
-copy_deployment_tree "CodeEdge Phase-1" "$root/deployments/codeedge-phase1" "$inputs/deployments/codeedge-phase1" 0
-copy_deployment_tree "CodeEdge evaluator child" "$root/deployments/codeedge-evaluator-child" "$inputs/deployments/codeedge-evaluator-child" 1
 reject_nonproduction_material "$inputs/deployments"
 
 ldflags="$(cd "$root" && env GOFLAGS= go run -mod=readonly ./tools/harbor-flow-production-build \
   --standard-authoring-catalog "$inputs/deployments/standard-authoring/operation-catalog.v1.json" \
   --standard-authoring-lock "$inputs/deployments/standard-authoring/operation-catalog.lock.json" \
-  --codeedge-phase1-catalog "$inputs/deployments/codeedge-phase1/operation-catalog.v1.json" \
-  --codeedge-phase1-lock "$inputs/deployments/codeedge-phase1/operation-catalog.lock.json" \
-  --codeedge-evaluator-catalog "$inputs/deployments/codeedge-evaluator-child/operation-catalog.v1.json" \
-  --codeedge-evaluator-lock "$inputs/deployments/codeedge-evaluator-child/operation-catalog.lock.json" \
   --source-manifest "$source_manifest")"
 
 mkdir -p "$package/deployments"
 install -m 0644 "$production_package_readme" "$package/README.md"
 copy_deployment_tree "staged Standard authoring" "$inputs/deployments/standard-authoring" "$package/deployments/standard-authoring" 0
-copy_deployment_tree "staged CodeEdge Phase-1" "$inputs/deployments/codeedge-phase1" "$package/deployments/codeedge-phase1" 0
-copy_deployment_tree "staged CodeEdge evaluator child" "$inputs/deployments/codeedge-evaluator-child" "$package/deployments/codeedge-evaluator-child" 0
 reject_nonproduction_material "$package/deployments"
 
 (cd "$root" && env GOFLAGS= go build -mod=readonly -trimpath -buildvcs=false -ldflags "$ldflags -buildid=" -o "$package/harbor-factory" .)

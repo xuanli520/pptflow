@@ -7,13 +7,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/purplevoid/harbor-factory/internal/harbor/codeedge"
 	"github.com/purplevoid/harbor-factory/internal/harbor/stageprovider"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
-func TestProductionBuildLDFlagsBindsThreeVerifiedBundlesInStableOrder(t *testing.T) {
+func TestProductionBuildLDFlagsBindsVerifiedStandardAuthoringBundleInStableOrder(t *testing.T) {
 	fixture := newProductionBuildFixture(t)
 	flags, err := productionBuildLDFlags(fixture.config)
 	if err != nil {
@@ -29,8 +28,8 @@ func TestProductionBuildLDFlagsBindsThreeVerifiedBundlesInStableOrder(t *testing
 	if flags != want {
 		t.Fatalf("linker flags =\n%s\nwant:\n%s", flags, want)
 	}
-	if strings.Count(flags, "-X ") != 24 {
-		t.Fatalf("linker flag count = %d, want 24: %s", strings.Count(flags, "-X "), flags)
+	if strings.Count(flags, "-X ") != 8 {
+		t.Fatalf("linker flag count = %d, want 8: %s", strings.Count(flags, "-X "), flags)
 	}
 }
 
@@ -42,30 +41,6 @@ func TestProductionBuildLDFlagsRejectsMissingSwappedDuplicateAndDriftedInputs(t 
 		assertProductionBuildError(t, config, "standard authoring catalog is required")
 	})
 
-	t.Run("swapped bundle templates", func(t *testing.T) {
-		fixture := newProductionBuildFixture(t)
-		config := fixture.config
-		config.StandardAuthoringCatalog, config.CodeEdgePhase1Catalog = config.CodeEdgePhase1Catalog, config.StandardAuthoringCatalog
-		config.StandardAuthoringLock, config.CodeEdgePhase1Lock = config.CodeEdgePhase1Lock, config.StandardAuthoringLock
-		assertProductionBuildError(t, config, "standard authoring catalog template")
-	})
-
-	t.Run("duplicate deployment file", func(t *testing.T) {
-		fixture := newProductionBuildFixture(t)
-		config := fixture.config
-		config.CodeEdgeEvaluatorCatalog = config.StandardAuthoringCatalog
-		assertProductionBuildError(t, config, "duplicate deployment input")
-	})
-
-	t.Run("mismatched build identity", func(t *testing.T) {
-		fixture := newProductionBuildFixture(t)
-		parent := fixture.bundles["parent"]
-		changed := parent.lock.Clone()
-		changed.HarborFlowBuild.Commit = strings.Repeat("f", 40)
-		rewriteFixtureLock(t, parent.lockPath, changed)
-		assertProductionBuildError(t, fixture.config, "CodeEdge Phase-1 build identity does not match Standard authoring build identity")
-	})
-
 	t.Run("mismatched source manifest", func(t *testing.T) {
 		fixture := newProductionBuildFixture(t)
 		config := fixture.config
@@ -73,16 +48,16 @@ func TestProductionBuildLDFlagsRejectsMissingSwappedDuplicateAndDriftedInputs(t 
 		assertProductionBuildError(t, config, "Standard authoring lock source manifest does not match frozen source")
 	})
 
-	t.Run("catalog lock receipt drift", func(t *testing.T) {
+	t.Run("foreign template lock", func(t *testing.T) {
 		fixture := newProductionBuildFixture(t)
 		config := fixture.config
-		parentLockRaw, err := os.ReadFile(fixture.bundles["parent"].lockPath)
-		if err != nil {
-			t.Fatal(err)
-		}
-		config.CodeEdgeEvaluatorLock = filepath.Join(t.TempDir(), "foreign-parent.lock.json")
-		writeFixtureFile(t, config.CodeEdgeEvaluatorLock, parentLockRaw)
-		assertProductionBuildError(t, config, "CodeEdge evaluator child lock template")
+		foreignCatalogRaw := []byte(`{"format":"harbor.deployment-operation-catalog.v1","version":"1","catalog_id":"foreign","catalog_version":"1.0.0","template":{"id":"harbor.task-lifecycle","version":"2.2.0"},"operations":[]}`)
+		foreignLockRaw := []byte(`{"format":"harbor.operation-catalog.lock.v1","version":"1","lock_id":"foreign-lock","lock_version":"1.0.0","catalog_receipt":{"format":"harbor.operation-catalog-receipt.v1","version":"1","catalog_id":"foreign","catalog_version":"1.0.0","template":{"id":"harbor.foreign","version":"9.9.9"},"fingerprint":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"harbor_flow_build":{"module":"github.com/purplevoid/harbor-factory","version":"v2.0.0","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","content_sha256":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"operations":[]}`)
+		config.StandardAuthoringCatalog = filepath.Join(t.TempDir(), "foreign-catalog.json")
+		config.StandardAuthoringLock = filepath.Join(t.TempDir(), "foreign-lock.json")
+		writeFixtureFile(t, config.StandardAuthoringCatalog, foreignCatalogRaw)
+		writeFixtureFile(t, config.StandardAuthoringLock, foreignLockRaw)
+		assertProductionBuildError(t, config, "standard authoring catalog template")
 	})
 }
 
@@ -124,22 +99,14 @@ func newProductionBuildFixture(t *testing.T) productionBuildFixture {
 		Commit: strings.Repeat("a", 40), ContentSHA256: workflowkit.SHA256Fingerprint([]byte("frozen-source-manifest")),
 	}
 	standard := writeProductionBuildFixtureBundle(t, root, "standard", workflowadapter.StandardAuthoringCurrentWorkflowTemplate(), build)
-	parent := writeProductionBuildFixtureBundle(t, root, "parent", workflowadapter.CodeEdgePhase1WorkflowTemplate(), build)
-	evaluator := writeProductionBuildFixtureBundle(t, root, "evaluator", workflowadapter.CodeEdgeEvaluatorChildWorkflowTemplate(), build)
 	return productionBuildFixture{
 		config: productionBuildConfig{
 			StandardAuthoringCatalog: standard.catalogPath,
 			StandardAuthoringLock:    standard.lockPath,
-			CodeEdgePhase1Catalog:    parent.catalogPath,
-			CodeEdgePhase1Lock:       parent.lockPath,
-			CodeEdgeEvaluatorCatalog: evaluator.catalogPath,
-			CodeEdgeEvaluatorLock:    evaluator.lockPath,
 			SourceManifest:           string(build.ContentSHA256),
 		},
 		bundles: map[string]productionBuildFixtureBundle{
-			"standard":  standard,
-			"parent":    parent,
-			"evaluator": evaluator,
+			"standard": standard,
 		},
 		build: build,
 	}
@@ -160,26 +127,8 @@ func (fixture productionBuildFixture) expectedFlags(t *testing.T) string {
 				lockFingerprint: standardAuthoringBuildLockFingerprintVariable,
 			},
 		},
-		{
-			bundle: fixture.bundles["parent"], variables: buildVariables{
-				module: codeEdgePhase1BuildModuleVariable, version: codeEdgePhase1BuildVersionVariable,
-				commit: codeEdgePhase1BuildCommitVariable, digest: codeEdgePhase1BuildDigestVariable,
-				catalogReceiptFingerprint: codeEdgePhase1BuildCatalogReceiptFingerprintVariable,
-				lockID:                    codeEdgePhase1BuildLockIDVariable, lockVersion: codeEdgePhase1BuildLockVersionVariable,
-				lockFingerprint: codeEdgePhase1BuildLockFingerprintVariable,
-			},
-		},
-		{
-			bundle: fixture.bundles["evaluator"], variables: buildVariables{
-				module: codeEdgeEvaluatorBuildModuleVariable, version: codeEdgeEvaluatorBuildVersionVariable,
-				commit: codeEdgeEvaluatorBuildCommitVariable, digest: codeEdgeEvaluatorBuildDigestVariable,
-				catalogReceiptFingerprint: codeEdgeEvaluatorBuildCatalogReceiptFingerprintVariable,
-				lockID:                    codeEdgeEvaluatorBuildLockIDVariable, lockVersion: codeEdgeEvaluatorBuildLockVersionVariable,
-				lockFingerprint: codeEdgeEvaluatorBuildLockFingerprintVariable,
-			},
-		},
 	}
-	flags := make([]string, 0, 24)
+	flags := make([]string, 0, 8)
 	for _, item := range ordered {
 		receipt, err := item.bundle.lock.CatalogReceipt.Fingerprint()
 		if err != nil {
@@ -220,19 +169,11 @@ func writeProductionBuildFixtureBundle(t *testing.T, root, name string, template
 		CatalogReceipt: catalog.Receipt(), HarborFlowBuild: build, Operations: []stageprovider.DeploymentOperationCatalogLockRecord{},
 	}
 	profile := fixtureExecutionProfile(t, template, "production-build-"+name+"-profile")
-	switch {
-	case workflowadapter.IsStandardAuthoringWorkflowTemplate(template.Catalog.Template):
-		lock.StandardAuthoringExecutionProfile = &stageprovider.StandardAuthoringExecutionProfileLock{Profile: profile}
-		lock.StandardAuthoringSSHTransport = fixtureStandardAuthoringSSHTransport()
-	case template.Catalog.Template.Equal(workflowadapter.CodeEdgePhase1TemplateReference()):
-		lock.CodeEdgePhase1ExecutionProfile = &stageprovider.CodeEdgePhase1ExecutionProfileLock{Profile: profile}
-		lock.CodeEdgePhase1PreflightProfile = &stageprovider.CodeEdgePhase1PreflightProfileLock{Profile: fixtureCodeEdgePhase1PreflightProfile()}
-		lock.CodeEdgePhase1FinalCompliancePolicy = &stageprovider.CodeEdgePhase1FinalCompliancePolicyLock{Policy: fixtureFinalCompliancePolicy()}
-	case template.Catalog.Template.Equal(workflowadapter.CodeEdgeEvaluatorChildTemplateReference()):
-		lock.CodeEdgeEvaluatorChildExecutionProfile = &stageprovider.CodeEdgeEvaluatorChildExecutionProfileLock{Profile: profile}
-	default:
+	if !workflowadapter.IsStandardAuthoringWorkflowTemplate(template.Catalog.Template) {
 		t.Fatalf("unsupported fixture template %s@%s", template.Catalog.Template.ID, template.Catalog.Template.Version)
 	}
+	lock.StandardAuthoringExecutionProfile = &stageprovider.StandardAuthoringExecutionProfileLock{Profile: profile}
+	lock.StandardAuthoringSSHTransport = fixtureStandardAuthoringSSHTransport()
 	if _, err := stageprovider.NewDeploymentOperationCatalogLockResolver(catalog, lock); err != nil {
 		t.Fatalf("create %s lock: %v", name, err)
 	}
@@ -277,48 +218,6 @@ func fixtureExecutionProfile(t *testing.T, template workflowadapter.WorkflowTemp
 		t.Fatalf("create fixture profile for %s@%s: %v", template.ID, template.Version, err)
 	}
 	return profile
-}
-
-func fixtureFinalCompliancePolicy() codeedge.FinalCompliancePolicy {
-	maximumPassingTrials := 1
-	qwen := codeedge.EvaluationPolicy{
-		ID: "production-build.qwen", Version: "1.0.0", HarborEvidenceFormat: codeedge.HarborRunBundleV018Format,
-		Evaluator: codeedge.EvaluatorIdentity{
-			ProfileID: "production-build-qwen", ProfileVersion: "1.0.0", AgentName: "fixture-agent", AgentVersion: "1.0.0", ModelName: "fixture-qwen", ModelProvider: "controlled",
-		},
-		LogicalTrialCount: 4, PassRewardKey: "reward", PassRewardAtLeast: 1, MaxPassingTrials: &maximumPassingTrials,
-		MinimumAverageTurns: 20, ScreenshotMediaType: "image/png", FailureClassifierID: "fixture-infra", FailureClassifierVersion: "1.0.0",
-		InfraExceptionTypes: []string{"NetworkError"},
-	}
-	opus := qwen.Clone()
-	opus.ID = "production-build.opus"
-	opus.Evaluator.ProfileID = "production-build-opus"
-	opus.Evaluator.ModelName = "fixture-opus"
-	opus.MaxPassingTrials = nil
-	return codeedge.FinalCompliancePolicy{
-		ID: "production-build.final-compliance", Version: "1.0.0", QwenPolicy: qwen, OpusPolicy: opus,
-		SubmissionCheckerID: "production-build.submission-check", SubmissionCheckerVersion: "1.0.0",
-		SubmissionReportSchemaVersion: workflowadapter.CodeEdgeSubmissionReportSchemaVersion,
-	}
-}
-
-func fixtureCodeEdgePhase1PreflightProfile() codeedge.Profile {
-	return codeedge.Profile{
-		Metadata: codeedge.MetadataFieldMapping{
-			CodeLang:    codeedge.TOMLPath{"metadata", "code_lang"},
-			TaskType:    codeedge.TOMLPath{"metadata", "task_type"},
-			Application: codeedge.TOMLPath{"metadata", "application"},
-			IsZeroToOne: codeedge.TOMLPath{"metadata", "is_0_to_1"},
-			GitHubURL:   codeedge.TOMLPath{"metadata", "github_url"},
-			CommitID:    codeedge.TOMLPath{"metadata", "commit_id"},
-		},
-		ProtectedEnvironmentVariables: []string{
-			"ANTHROPIC_AUTH_TOKEN",
-			"ANTHROPIC_BASE_URL",
-			"OPUS_HARBOR_BASE_URL",
-			"QWEN_HARBOR_BASE_URL",
-		},
-	}
 }
 
 func rewriteFixtureLock(t *testing.T, path string, lock stageprovider.DeploymentOperationCatalogLock) {

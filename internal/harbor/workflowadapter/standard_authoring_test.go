@@ -18,7 +18,7 @@ func TestStandardAuthoringV3IsClosedPreMaterializationWorkflow(t *testing.T) {
 		t.Fatalf("authoring stage count = %d, want %d", len(template.Catalog.Stages), len(StandardAuthoringStageOrder()))
 	}
 	for _, forbidden := range []workflowkit.StageKey{
-		workflowkit.StageKey(RepoAnalyze), workflowkit.StageKey(TaskDesign), workflowkit.StageKey(GenerateTaskFiles), workflowkit.StageKey(AuthoringHarness), workflowkit.StageKey(TaskRepair), workflowkit.StageKey(RuntimeSelfCheck), workflowkit.StageKey(HarborRunQwen), workflowkit.StageKey(Package),
+		workflowkit.StageKey(RepoAnalyze), workflowkit.StageKey(TaskDesign), workflowkit.StageKey(GenerateTaskFiles), workflowkit.StageKey(AuthoringHarness), workflowkit.StageKey(TaskRepair), workflowkit.StageKey(RuntimeSelfCheck), workflowkit.StageKey(Package),
 	} {
 		if _, present := template.Catalog.Stage(forbidden); present {
 			t.Fatalf("source-session authoring catalog unexpectedly contains task-bound stage %q", forbidden)

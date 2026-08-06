@@ -1,6 +1,7 @@
 package app
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -17,6 +18,49 @@ import (
 	"github.com/purplevoid/harbor-factory/internal/testsupport"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
+
+// standardAuthoringParentSourceSnapshot is the canonical source archive
+// fixture shared by materialized-task tests. It is validated through the same
+// standard-authoring source capture boundary that production uses.
+func standardAuthoringParentSourceSnapshot(t *testing.T) []byte {
+	t.Helper()
+	var buffer bytes.Buffer
+	writer := tar.NewWriter(&buffer)
+	entries := []struct {
+		name    string
+		mode    int64
+		content []byte
+		dir     bool
+	}{
+		{name: "source/", mode: 0o755, dir: true},
+		{name: "source/README.md", mode: 0o644, content: []byte("fixture source tree\n")},
+	}
+	for _, entry := range entries {
+		header := &tar.Header{Name: entry.name, Mode: entry.mode}
+		if entry.dir {
+			header.Typeflag = tar.TypeDir
+		} else {
+			header.Typeflag = tar.TypeReg
+			header.Size = int64(len(entry.content))
+		}
+		if err := writer.WriteHeader(header); err != nil {
+			t.Fatal(err)
+		}
+		if !entry.dir {
+			if _, err := writer.Write(entry.content); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	source := buffer.Bytes()
+	if err := validateStandardAuthoringSourceArchiveBytes(source); err != nil {
+		t.Fatalf("source snapshot fixture is invalid: %v", err)
+	}
+	return source
+}
 
 func newLifecycleServicesForTest(root string, dataStore *store.Store) (*LifecycleServices, error) {
 	return NewLifecycleServicesWithOptions(root, dataStore, LifecycleServicesOptions{
@@ -371,57 +415,6 @@ func TestRunServiceRequiresCompleteExplicitProfileAndFreezesManifest(t *testing.
 	}
 }
 
-func TestRunServiceResolvesOnlyTheTemplateFrozenByProfileAndExecutionSpec(t *testing.T) {
-	ctx := context.Background()
-	root := t.TempDir()
-	dataStore, err := store.OpenForTest(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer dataStore.Close()
-	services, err := newLifecycleServicesForTest(root, dataStore)
-	if err != nil {
-		t.Fatal(err)
-	}
-	task, revision := createStandardMaterializedLifecycleTask(t, ctx, services, "codeedge-template", "CodeEdge Template", "CodeEdge template selection\n")
-
-	profile := lifecycleCompleteProfileForTemplate(t, workflowadapter.CodeEdgePhase1WorkflowTemplate())
-	specification := testsupport.CompleteCodeEdgePhase1RunExecutionSpec(task.ID, revision.ID, revision.TaskDigest)
-	run, err := services.Runs.StartRun(ctx, StartRunRequest{
-		TaskID: task.ID, RevisionID: revision.ID, Profile: profile, ExecutionSpec: specification,
-		Trigger: "codeedge-phase1", Actor: "tester", Reason: "freeze CodeEdge template",
-	})
-	if err != nil {
-		t.Fatalf("start CodeEdge run: %v", err)
-	}
-	if run.WorkflowTemplateID != workflowadapter.CodeEdgePhase1WorkflowTemplateID || run.WorkflowTemplateVersion != workflowadapter.CodeEdgePhase1WorkflowTemplateVersion {
-		t.Fatalf("run template = %s@%s, want CodeEdge Phase-1", run.WorkflowTemplateID, run.WorkflowTemplateVersion)
-	}
-	var manifest runManifest
-	if err := json.Unmarshal([]byte(run.RunManifestJSON), &manifest); err != nil {
-		t.Fatal(err)
-	}
-	if !manifest.Resolved.Template.Equal(workflowadapter.CodeEdgePhase1TemplateReference()) || manifest.Resolved.Descriptor.Stages[len(manifest.Resolved.Descriptor.Stages)-1].Key != workflowkit.StageKey(workflowadapter.Package) {
-		t.Fatalf("CodeEdge run did not freeze its closed descriptor: %+v", manifest.Resolved.Template)
-	}
-
-	mismatched := specification.Clone()
-	mismatched.Template = workflowadapter.StandardTemplateReference()
-	if _, err := services.Runs.StartRun(ctx, StartRunRequest{
-		TaskID: task.ID, RevisionID: revision.ID, Profile: profile, ExecutionSpec: mismatched,
-		Trigger: "codeedge-template-mismatch", Actor: "tester", Reason: "reject template mismatch",
-	}); err == nil {
-		t.Fatal("run accepted mismatched profile/specification templates")
-	}
-	runs, err := dataStore.ListWorkflowRunsForTask(ctx, task.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(runs) != 1 || runs[0].ID != run.ID {
-		t.Fatalf("template mismatch created durable work: %+v", runs)
-	}
-}
-
 func writeLifecycleSnapshot(t *testing.T, instruction string) string {
 	t.Helper()
 	root := t.TempDir()
@@ -443,7 +436,7 @@ func createStandardMaterializedLifecycleTask(t *testing.T, ctx context.Context, 
 		title = slug
 	}
 	actor := "standard-materialized-fixture"
-	sourceArchive := codeEdgePhase1ParentSourceSnapshot(t)
+	sourceArchive := standardAuthoringParentSourceSnapshot(t)
 	sourceObject, err := services.core.objects.PutBytes(ctx, sourceArchive)
 	if err != nil {
 		t.Fatalf("store source snapshot fixture: %v", err)
@@ -453,7 +446,7 @@ func createStandardMaterializedLifecycleTask(t *testing.T, ctx context.Context, 
 	source, err := services.core.store.CreateAuthoringSource(ctx, store.CreateAuthoringSourceRequest{
 		RepositoryURL: repositoryURL, CommitSHA: commitSHA,
 		SnapshotArtifactRef: string(sourceObject.Digest), SnapshotContentDigest: string(sourceObject.Digest),
-		SnapshotSchemaVersion: workflowadapter.CodeEdgeSourceSnapshotSchemaVersion,
+		SnapshotSchemaVersion: StandardAuthoringSourceSnapshotSchemaVersion,
 		IdempotencyKey:        "standard-source:" + slug, Actor: actor, Reason: "freeze Standard source fixture",
 	})
 	if err != nil {

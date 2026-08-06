@@ -10,13 +10,11 @@ import (
 )
 
 const (
-	productionDeploymentsDirectory            = "deployments"
-	standardAuthoringDeploymentDirectory      = "standard-authoring"
-	codeEdgePhase1DeploymentDirectory         = "codeedge-phase1"
-	codeEdgeEvaluatorChildDeploymentDirectory = "codeedge-evaluator-child"
-	productionDeploymentCatalogFile           = "operation-catalog.v1.json"
-	productionDeploymentLockFile              = "operation-catalog.lock.json"
-	standardAuthoringContractManifestFile     = "contract-assets.v1.json"
+	productionDeploymentsDirectory        = "deployments"
+	standardAuthoringDeploymentDirectory  = "standard-authoring"
+	productionDeploymentCatalogFile       = "operation-catalog.v1.json"
+	productionDeploymentLockFile          = "operation-catalog.lock.json"
+	standardAuthoringContractManifestFile = "contract-assets.v1.json"
 )
 
 // productionDeploymentPaths names the complete, immutable local materials
@@ -27,10 +25,6 @@ type productionDeploymentPaths struct {
 	StandardCatalog      string
 	StandardLock         string
 	StandardContractRoot string
-	ParentCatalog        string
-	ParentLock           string
-	EvaluatorCatalog     string
-	EvaluatorLock        string
 }
 
 func defaultProductionDeploymentPaths() (productionDeploymentPaths, error) {
@@ -59,48 +53,114 @@ func productionDeploymentPathsBesideExecutable(executable string) (productionDep
 		return productionDeploymentPaths{}, fmt.Errorf("production executable must be a regular non-symlink file")
 	}
 	root := filepath.Dir(resolvedExecutable)
-	deployments, err := requireCodeEdgeProductionManagedDirectory("deployment directory", filepath.Join(root, productionDeploymentsDirectory), root)
+	deployments, err := requireManagedProductionDirectory("deployment directory", filepath.Join(root, productionDeploymentsDirectory), root)
 	if err != nil {
 		return productionDeploymentPaths{}, fmt.Errorf("locate production deployment directory: %w", err)
 	}
-	standard, err := requireCodeEdgeProductionManagedDirectory("Standard authoring deployment directory", filepath.Join(deployments, standardAuthoringDeploymentDirectory), root)
+	standard, err := requireManagedProductionDirectory("Standard authoring deployment directory", filepath.Join(deployments, standardAuthoringDeploymentDirectory), root)
 	if err != nil {
 		return productionDeploymentPaths{}, err
 	}
-	parent, err := requireCodeEdgeProductionManagedDirectory("CodeEdge Phase-1 deployment directory", filepath.Join(deployments, codeEdgePhase1DeploymentDirectory), root)
+	catalog, err := requireManagedProductionFileWithin("Standard authoring catalog", filepath.Join(standard, productionDeploymentCatalogFile), root)
 	if err != nil {
 		return productionDeploymentPaths{}, err
 	}
-	evaluator, err := requireCodeEdgeProductionManagedDirectory("CodeEdge evaluator-child deployment directory", filepath.Join(deployments, codeEdgeEvaluatorChildDeploymentDirectory), root)
+	lock, err := requireManagedProductionFileWithin("Standard authoring lock", filepath.Join(standard, productionDeploymentLockFile), root)
 	if err != nil {
 		return productionDeploymentPaths{}, err
 	}
-	paths := productionDeploymentPaths{StandardContractRoot: standard}
-	for _, entry := range []struct {
-		label       string
-		directory   string
-		catalogDest *string
-		lockDest    *string
-	}{
-		{"Standard authoring", standard, &paths.StandardCatalog, &paths.StandardLock},
-		{"CodeEdge Phase-1", parent, &paths.ParentCatalog, &paths.ParentLock},
-		{"CodeEdge evaluator child", evaluator, &paths.EvaluatorCatalog, &paths.EvaluatorLock},
-	} {
-		catalog, catalogErr := requireCodeEdgeProductionFileWithin(entry.label+" catalog", filepath.Join(entry.directory, productionDeploymentCatalogFile), root)
-		if catalogErr != nil {
-			return productionDeploymentPaths{}, catalogErr
-		}
-		lock, lockErr := requireCodeEdgeProductionFileWithin(entry.label+" lock", filepath.Join(entry.directory, productionDeploymentLockFile), root)
-		if lockErr != nil {
-			return productionDeploymentPaths{}, lockErr
-		}
-		*entry.catalogDest, *entry.lockDest = catalog, lock
-	}
-	if _, err := requireCodeEdgeProductionFileWithin("Standard authoring contract asset manifest", filepath.Join(standard, standardAuthoringContractManifestFile), root); err != nil {
+	if _, err := requireManagedProductionFileWithin("Standard authoring contract asset manifest", filepath.Join(standard, standardAuthoringContractManifestFile), root); err != nil {
 		return productionDeploymentPaths{}, err
 	}
-	if _, err := requireCodeEdgeProductionFileWithin("Standard authoring SSH known_hosts", filepath.Join(standard, filepath.FromSlash(stageprovider.StandardAuthoringSSHKnownHostsRelativePath)), root); err != nil {
+	if _, err := requireManagedProductionFileWithin("Standard authoring SSH known_hosts", filepath.Join(standard, filepath.FromSlash(stageprovider.StandardAuthoringSSHKnownHostsRelativePath)), root); err != nil {
 		return productionDeploymentPaths{}, err
 	}
-	return paths, nil
+	return productionDeploymentPaths{StandardCatalog: catalog, StandardLock: lock, StandardContractRoot: standard}, nil
+}
+
+// requireManagedProductionDirectory accepts one deployment directory only
+// when it is a real directory below the resolved executable directory. Both
+// deployment path components are checked separately so a symlink cannot
+// redirect an otherwise regular catalog or lock outside the local package.
+func requireManagedProductionDirectory(label, path, executableDirectory string) (string, error) {
+	path = strings.TrimSpace(path)
+	executableDirectory = strings.TrimSpace(executableDirectory)
+	if path == "" || executableDirectory == "" {
+		return "", fmt.Errorf("production %s path is required", label)
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve production %s path: %w", label, err)
+	}
+	if !managedProductionPathWithin(executableDirectory, absolute) {
+		return "", fmt.Errorf("production %s escapes the resolved executable directory", label)
+	}
+	info, err := os.Lstat(absolute)
+	if err != nil {
+		return "", fmt.Errorf("inspect production %s: %w", label, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return "", fmt.Errorf("production %s must be a non-symlink directory", label)
+	}
+	resolved, err := filepath.EvalSymlinks(absolute)
+	if err != nil {
+		return "", fmt.Errorf("resolve production %s: %w", label, err)
+	}
+	if filepath.Clean(resolved) != filepath.Clean(absolute) || !managedProductionPathWithin(executableDirectory, resolved) {
+		return "", fmt.Errorf("production %s escapes the resolved executable directory", label)
+	}
+	return filepath.Clean(absolute), nil
+}
+
+// requireManagedProductionFileWithin retains the regular-file/no-final-
+// symlink rule and additionally proves that resolving every path component
+// still names a file inside the resolved executable directory.
+func requireManagedProductionFileWithin(label, path, executableDirectory string) (string, error) {
+	file, err := requireManagedProductionFile(label, path)
+	if err != nil {
+		return "", err
+	}
+	resolved, err := filepath.EvalSymlinks(file)
+	if err != nil {
+		return "", fmt.Errorf("resolve production %s: %w", label, err)
+	}
+	if filepath.Clean(resolved) != filepath.Clean(file) || !managedProductionPathWithin(executableDirectory, resolved) {
+		return "", fmt.Errorf("production %s escapes the resolved executable directory", label)
+	}
+	return file, nil
+}
+
+func managedProductionPathWithin(root, path string) bool {
+	root, err := filepath.Abs(strings.TrimSpace(root))
+	if err != nil {
+		return false
+	}
+	path, err = filepath.Abs(strings.TrimSpace(path))
+	if err != nil {
+		return false
+	}
+	relative, err := filepath.Rel(filepath.Clean(root), filepath.Clean(path))
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+		return false
+	}
+	return true
+}
+
+func requireManagedProductionFile(label, path string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", fmt.Errorf("production %s path is required", label)
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve production %s path: %w", label, err)
+	}
+	info, err := os.Lstat(absolute)
+	if err != nil {
+		return "", fmt.Errorf("inspect production %s: %w", label, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return "", fmt.Errorf("production %s must be a regular non-symlink file", label)
+	}
+	return filepath.Clean(absolute), nil
 }

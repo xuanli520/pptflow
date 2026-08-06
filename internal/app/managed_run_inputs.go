@@ -4,11 +4,8 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"reflect"
 	"sort"
@@ -94,7 +91,7 @@ func (service *RunService) prepareManagedInitialRunInputsAt(ctx context.Context,
 	if archiveTimestamp.IsZero() {
 		return workflowadapter.RunExecutionSpec{}, nil, fmt.Errorf("managed task snapshot archive timestamp is required")
 	}
-	requiredPorts, err := intrinsicTemplateInputPorts(specification, []string{managedTaskSnapshotInputPort, workflowadapter.CodeEdgeSourceSnapshotArtifact})
+	requiredPorts, err := intrinsicTemplateInputPorts(specification, []string{managedTaskSnapshotInputPort})
 	if err != nil {
 		return workflowadapter.RunExecutionSpec{}, nil, err
 	}
@@ -225,25 +222,17 @@ func recoveredManagedInputsByPort(recovered []runManifestManagedInput, requiredP
 }
 
 func managedRunInputSchemaVersion(port string) string {
-	switch port {
-	case managedTaskSnapshotInputPort:
+	if port == managedTaskSnapshotInputPort {
 		return "harbor.artifact.v1"
-	case workflowadapter.CodeEdgeSourceSnapshotArtifact:
-		return workflowadapter.CodeEdgeSourceSnapshotSchemaVersion
-	default:
-		return ""
 	}
+	return ""
 }
 
 func materializeManagedRunInputObjectAt(ctx context.Context, core *lifecycleServiceCore, revision store.TaskRevision, archiveTimestamp time.Time, port string) (workflowruntime.ObjectRef, error) {
-	switch port {
-	case managedTaskSnapshotInputPort:
+	if port == managedTaskSnapshotInputPort {
 		return materializeManagedTaskSnapshotObjectAt(ctx, core, revision, archiveTimestamp)
-	case workflowadapter.CodeEdgeSourceSnapshotArtifact:
-		return materializeManagedSourceSnapshotObject(ctx, core, revision)
-	default:
-		return workflowruntime.ObjectRef{}, fmt.Errorf("unsupported managed input port %q", port)
 	}
+	return workflowruntime.ObjectRef{}, fmt.Errorf("unsupported managed input port %q", port)
 }
 
 // materializeManagedTaskSnapshotObject writes the sealed revision snapshot as
@@ -309,83 +298,6 @@ func materializeManagedTaskSnapshotObjectAt(ctx context.Context, core *lifecycle
 		return workflowruntime.ObjectRef{}, fmt.Errorf("store sealed task snapshot archive: %w", err)
 	}
 	return object, nil
-}
-
-func materializeManagedSourceSnapshotObject(ctx context.Context, core *lifecycleServiceCore, revision store.TaskRevision) (workflowruntime.ObjectRef, error) {
-	if core == nil || core.store == nil || core.objects == nil {
-		return workflowruntime.ObjectRef{}, fmt.Errorf("managed source snapshot object store is not configured")
-	}
-	source, err := managedSourceSnapshotAuthoringSource(ctx, core, revision)
-	if err != nil {
-		return workflowruntime.ObjectRef{}, err
-	}
-	if source == nil ||
-		source.SnapshotArtifactRef != source.SnapshotContentDigest || source.SnapshotSchemaVersion != workflowadapter.CodeEdgeSourceSnapshotSchemaVersion {
-		return workflowruntime.ObjectRef{}, fmt.Errorf("managed source_snapshot source record does not match the materialized TaskRevision")
-	}
-	if _, err := standardAuthoringStoredSourceCoordinate(*source); err != nil {
-		return workflowruntime.ObjectRef{}, fmt.Errorf("managed source_snapshot source coordinate: %w", err)
-	}
-	reference := workflowruntime.ObjectRef{Digest: workflowkit.Fingerprint(source.SnapshotContentDigest)}
-	if err := reference.Digest.Validate(); err != nil {
-		return workflowruntime.ObjectRef{}, fmt.Errorf("managed source_snapshot digest: %w", err)
-	}
-	file, err := core.objects.Open(ctx, reference)
-	if err != nil {
-		return workflowruntime.ObjectRef{}, fmt.Errorf("open managed source_snapshot object: %w", err)
-	}
-	defer file.Close()
-	hash := sha256.New()
-	size, err := io.Copy(hash, file)
-	if err != nil {
-		return workflowruntime.ObjectRef{}, fmt.Errorf("read managed source_snapshot object: %w", err)
-	}
-	if actual := workflowkit.Fingerprint("sha256:" + hex.EncodeToString(hash.Sum(nil))); actual != reference.Digest {
-		return workflowruntime.ObjectRef{}, fmt.Errorf("managed source_snapshot object digest differs from AuthoringSource")
-	}
-	return workflowruntime.ObjectRef{Digest: reference.Digest, SizeBytes: size}, nil
-}
-
-func managedSourceSnapshotAuthoringSource(ctx context.Context, core *lifecycleServiceCore, revision store.TaskRevision) (*store.AuthoringSource, error) {
-	if revision.ID == "" || revision.TaskID == "" || revision.TaskDigest == "" {
-		return nil, fmt.Errorf("managed source_snapshot requires a complete TaskRevision subject")
-	}
-	originRevision := revision
-	visited := map[string]struct{}{}
-	for {
-		if _, duplicate := visited[revision.ID]; duplicate {
-			return nil, fmt.Errorf("managed source_snapshot revision lineage contains a cycle at %s", revision.ID)
-		}
-		visited[revision.ID] = struct{}{}
-		materialization, err := core.store.GetAuthoringTaskMaterializationForRevision(ctx, revision.ID)
-		if err != nil {
-			return nil, err
-		}
-		if materialization != nil {
-			if materialization.RevisionID != revision.ID || materialization.TaskID != revision.TaskID || materialization.TaskDigest != revision.TaskDigest {
-				return nil, fmt.Errorf("managed source_snapshot materialization does not match TaskRevision %s", revision.ID)
-			}
-			source, err := core.store.GetAuthoringSource(ctx, materialization.SourceID)
-			if err != nil {
-				return nil, err
-			}
-			if source == nil || source.ID != materialization.SourceID || source.SourceFingerprint != materialization.SourceFingerprint {
-				return nil, fmt.Errorf("managed source_snapshot source record does not match the materialized TaskRevision")
-			}
-			return source, nil
-		}
-		if revision.ParentRevisionID == "" {
-			return nil, fmt.Errorf("managed source_snapshot requires a Standard authoring materialization for TaskRevision %s", originRevision.ID)
-		}
-		parent, err := core.store.GetTaskRevision(ctx, revision.ParentRevisionID)
-		if err != nil {
-			return nil, err
-		}
-		if parent == nil || parent.TaskID != originRevision.TaskID {
-			return nil, fmt.Errorf("managed source_snapshot parent revision is missing for TaskRevision %s", revision.ID)
-		}
-		revision = *parent
-	}
 }
 
 func (service *RunService) ensureRunInputArtifacts(ctx context.Context, run store.WorkflowRun, manifest runManifest) error {

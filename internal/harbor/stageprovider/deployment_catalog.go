@@ -82,13 +82,12 @@ type DeploymentCheckoutContract struct {
 // Secrets contain references only. Secret values, paths, environment values,
 // and provider defaults must never enter this catalog or a Run manifest.
 type DeploymentOperationRegistration struct {
-	Stage           DeploymentStageContract               `json:"stage"`
-	Provider        workflowadapter.ProviderReference     `json:"provider"`
-	Operation       workflowadapter.StageOperationBinding `json:"operation"`
-	Runtime         workflowadapter.RuntimeReference      `json:"runtime"`
-	Checkout        DeploymentCheckoutContract            `json:"checkout"`
-	Secrets         []workflowadapter.SecretReference     `json:"secrets"`
-	HarborEvaluator *HarborEvaluatorOperationContract     `json:"harbor_evaluator,omitempty"`
+	Stage     DeploymentStageContract               `json:"stage"`
+	Provider  workflowadapter.ProviderReference     `json:"provider"`
+	Operation workflowadapter.StageOperationBinding `json:"operation"`
+	Runtime   workflowadapter.RuntimeReference      `json:"runtime"`
+	Checkout  DeploymentCheckoutContract            `json:"checkout"`
+	Secrets   []workflowadapter.SecretReference     `json:"secrets"`
 }
 
 // Clone returns an independently owned registration. It is used both at the
@@ -97,10 +96,6 @@ type DeploymentOperationRegistration struct {
 func (registration DeploymentOperationRegistration) Clone() DeploymentOperationRegistration {
 	registration.Operation = registration.Operation.Clone()
 	registration.Secrets = cloneDeploymentSecrets(registration.Secrets)
-	if registration.HarborEvaluator != nil {
-		contract := registration.HarborEvaluator.Clone()
-		registration.HarborEvaluator = &contract
-	}
 	return registration
 }
 
@@ -184,10 +179,6 @@ func (catalog DeploymentOperationCatalog) CanonicalJSON() ([]byte, error) {
 		sort.Slice(canonical.Operations[index].Secrets, func(left, right int) bool {
 			return deploymentSecretLess(canonical.Operations[index].Secrets[left], canonical.Operations[index].Secrets[right])
 		})
-		if canonical.Operations[index].HarborEvaluator != nil {
-			contract := canonical.Operations[index].HarborEvaluator.canonicalized()
-			canonical.Operations[index].HarborEvaluator = &contract
-		}
 	}
 	sort.Slice(canonical.Operations, func(left, right int) bool {
 		return deploymentCoordinateForRegistration(canonical.Operations[left]).less(deploymentCoordinateForRegistration(canonical.Operations[right]))
@@ -724,14 +715,6 @@ func validateDeploymentOperationRegistration(registration DeploymentOperationReg
 		}
 		seenSecrets[secret.ID] = secret
 	}
-	payload, localCommand := registration.Operation.Payload.(workflowadapter.LocalCommandOperationPayload)
-	if registration.HarborEvaluator != nil {
-		if err := validateHarborEvaluatorCatalogRegistration(*registration.HarborEvaluator, registration, catalog); err != nil {
-			return err
-		}
-	} else if localCommand && isHarborEvaluatorCommandID(payload.CommandID) {
-		return fmt.Errorf("Harbor evaluator command %q requires a typed Harbor evaluator contract", payload.CommandID)
-	}
 	return nil
 }
 
@@ -1035,16 +1018,6 @@ func deploymentStageBindingType(key workflowkit.StageKey) (workflowadapter.Stage
 		return workflowadapter.StageBindingSimilarityCheck, true
 	case workflowadapter.FinalReview:
 		return workflowadapter.StageBindingFinalReview, true
-	case workflowadapter.HarborRunQwen:
-		return workflowadapter.StageBindingHarborRunQwen, true
-	case workflowadapter.HarborRunOpus:
-		return workflowadapter.StageBindingHarborRunOpus, true
-	case workflowadapter.EvaluatorEvidenceHandoff:
-		return workflowadapter.StageBindingEvaluatorEvidenceHandoff, true
-	case workflowadapter.ResultReview:
-		return workflowadapter.StageBindingResultReview, true
-	case workflowadapter.SubmissionLint:
-		return workflowadapter.StageBindingSubmissionLint, true
 	case workflowadapter.Package:
 		return workflowadapter.StageBindingPackage, true
 	default:

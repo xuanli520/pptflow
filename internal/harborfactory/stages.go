@@ -32,11 +32,6 @@ const (
 	QualityCheck             = "quality_check"
 	SimilarityCheck          = "similarity_check"
 	FinalReview              = "final_review"
-	HarborRunQwen            = "harbor_run_qwen"
-	HarborRunOpus            = "harbor_run_opus"
-	EvaluatorEvidenceHandoff = "evaluator_evidence_handoff"
-	ResultReview             = "result_review"
-	SubmissionLint           = "submission_lint"
 	Package                  = "package"
 )
 
@@ -50,8 +45,6 @@ const (
 	StageQuality        = "quality"
 	StageSimilarity     = "similarity"
 	StageFinalReview    = "final_review"
-	StageEvaluation     = "evaluation"
-	StageSubmission     = "submission"
 	StageDelivery       = "delivery"
 )
 
@@ -62,15 +55,4 @@ var StandardAuthoringStageOrder = []workflowkit.StageKey{
 	GenerateTaskFiles, InstructionGen, TaskTOMLGen, DockerfileGen,
 	ContentReview, SolveGen, TestGen, TestsAnalysis,
 	SolutionReview, MaterializeTask,
-}
-
-// CodeEdgePhase1StageOrder is the dependency-ordered stage list for
-// CodeEdge Phase-1 compliance and evaluation.
-var CodeEdgePhase1StageOrder = []workflowkit.StageKey{
-	RepoPrepare, RepoAnalyze, CodeEdgeLint,
-	DockerBuild, InitialVerify, OracleVerify,
-	TestsAnalysis, SolutionReview,
-	QualityCheck, SimilarityCheck,
-	FinalReview, EvaluatorEvidenceHandoff,
-	SubmissionLint, ResultReview, Package,
 }

@@ -3,7 +3,6 @@ package cmd
 import (
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/app"
 	"github.com/purplevoid/harbor-factory/internal/harbor/codeedge"
@@ -15,9 +14,8 @@ import (
 
 // Linker variables are intentionally blank in developer builds. A final
 // package must inject a Standard-specific catalog receipt and lock identity;
-// sharing the CodeEdge evaluator binding would make one template authorize a
-// different template, so it is prohibited even when both locks describe the
-// same Harbor Flow source build.
+// a different template must never authorize a Standard authoring Run through
+// a foreign catalog or lock.
 var (
 	standardAuthoringProductionBuildModule                    string
 	standardAuthoringProductionBuildVersion                   string
@@ -62,15 +60,12 @@ type standardAuthoringProductionCompositionConfig struct {
 	CatalogReceiptFingerprint workflowkit.Fingerprint
 	LockIdentity              stageprovider.DeploymentOperationCatalogLockIdentity
 	LookupEnvironment         func(string) (string, bool)
-	AdmissionContract         *codeedge.TaskAdmissionContract
-	CandidateHarness          *app.StandardAuthoringDockerHarness
-	CandidateDockerCommands   []stageprovider.LocalExecutableLock
 }
 
 // standardAuthoringProductionComposition is a template-keyed capability
-// bundle. Root composition combines it with the separate CodeEdge Phase-1 and
-// evaluator-child bundles; this helper deliberately does not mutate or choose
-// the process-wide default factory by itself.
+// bundle. Root composition installs it as the sole production template; this
+// helper deliberately does not mutate or choose the process-wide default
+// factory by itself.
 type standardAuthoringProductionComposition struct {
 	Resolver       *stageprovider.CatalogLockAttestedWorkflowkitProviderOperationResolver
 	CatalogBinding app.TemplateDeploymentCatalogResolver
@@ -106,19 +101,6 @@ func newStandardAuthoringProductionComposition(config standardAuthoringProductio
 	if err != nil {
 		return nil, fmt.Errorf("load lock-owned Standard authoring execution profile: %w", err)
 	}
-	candidateHarness := config.CandidateHarness
-	if candidateHarness == nil && len(config.CandidateDockerCommands) != 0 {
-		commandTimeout, err := standardAuthoringCandidateCommandTimeout(profile)
-		if err != nil {
-			return nil, err
-		}
-		candidateHarness, err = app.NewStandardAuthoringDockerHarness(app.StandardAuthoringDockerHarnessConfig{
-			ManagedRoot: config.ManagedRoot, LockedCommands: config.CandidateDockerCommands, CommandTimeout: commandTimeout,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("construct Standard authoring Docker harness: %w", err)
-		}
-	}
 	attestor, err := stageprovider.NewStandardAuthoringRuntimeAttestor(stageprovider.StandardAuthoringRuntimeAttestorConfig{
 		HarborFlowBuild: binding.HarborFlowBuild, ContractRoot: bundle.ContractRoot,
 	})
@@ -149,7 +131,16 @@ func newStandardAuthoringProductionComposition(config standardAuthoringProductio
 	if err != nil {
 		return nil, fmt.Errorf("construct Standard authoring repo_prepare executor: %w", err)
 	}
-	materializer, err := app.NewStandardAuthoringMaterializeExecutor(app.StandardAuthoringMaterializeExecutorConfig{ManagedRoot: config.ManagedRoot, Store: config.Store, Admission: config.AdmissionContract, CandidateHarness: candidateHarness})
+	admission := codeedge.TaskAdmissionContract{
+		ID: bundle.Verifier.LockIdentity().LockID, Version: bundle.Verifier.LockIdentity().LockVersion,
+		Profile: standardAuthoringTaskAdmissionProfile(),
+	}
+	if err := admission.Validate(); err != nil {
+		return nil, fmt.Errorf("construct Standard authoring CodeEdge task admission contract: %w", err)
+	}
+	materializer, err := app.NewStandardAuthoringMaterializeExecutor(app.StandardAuthoringMaterializeExecutorConfig{
+		ManagedRoot: config.ManagedRoot, Store: config.Store, Admission: &admission,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("construct Standard authoring materializer: %w", err)
 	}
@@ -159,7 +150,6 @@ func newStandardAuthoringProductionComposition(config standardAuthoringProductio
 		CodexWorkspaceRoot:  workspaceRoot,
 		CodexWorkspaceMode:  stageprovider.StandardAuthoringCodexWorkspaceRunScoped,
 		CodexSourceVerifier: repoPrepare,
-		CandidateValidator:  candidateHarness,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("construct Standard authoring provider composition: %w", err)
@@ -179,19 +169,24 @@ func newStandardAuthoringProductionComposition(config standardAuthoringProductio
 	return composition, nil
 }
 
-// standardAuthoringCandidateCommandTimeout uses the owning template's frozen
-// host verification attempt budget. The outer stage context remains the final
-// deadline, while the Docker runtime must not impose the shorter CodeEdge
-// parent-command ceiling on a potentially long environment build.
-func standardAuthoringCandidateCommandTimeout(profile workflowadapter.ExecutionProfile) (time.Duration, error) {
-	if err := profile.Validate(); err != nil {
-		return 0, err
+// standardAuthoringTaskAdmissionProfile is the deployment-owned consumer
+// policy bound into every Standard authoring task package admission. It is a
+// code-frozen mirror of the pre-materialization contract: metadata field paths
+// are stable template-relative locations, and the protected names are the
+// CodeEdge consumer credentials that a task-owned Dockerfile or Compose
+// document may never interpolate.
+func standardAuthoringTaskAdmissionProfile() codeedge.Profile {
+	return codeedge.Profile{
+		Metadata: codeedge.MetadataFieldMapping{
+			CodeLang:    codeedge.TOMLPath{"metadata", "code_lang"},
+			TaskType:    codeedge.TOMLPath{"metadata", "task_type"},
+			Application: codeedge.TOMLPath{"metadata", "application"},
+			IsZeroToOne: codeedge.TOMLPath{"metadata", "is_0_to_1"},
+			GitHubURL:   codeedge.TOMLPath{"metadata", "github_url"},
+			CommitID:    codeedge.TOMLPath{"metadata", "commit_id"},
+		},
+		ProtectedEnvironmentVariables: []string{"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "OPUS_HARBOR_BASE_URL", "QWEN_HARBOR_BASE_URL"},
 	}
-	budget, found := profile.Budget(workflowkit.StageKey(workflowadapter.HostCandidateVerify))
-	if !found || budget.AttemptTimeout <= 0 {
-		return 0, fmt.Errorf("Standard authoring profile omits a usable command budget for %q", workflowadapter.HostCandidateVerify)
-	}
-	return budget.AttemptTimeout, nil
 }
 
 func standardAuthoringLockedGit(lock stageprovider.DeploymentOperationCatalogLock) (stageprovider.LocalExecutableLock, error) {
@@ -232,4 +227,8 @@ func linkedStandardAuthoringProductionBuildBinding() (standardAuthoringProductio
 		return standardAuthoringProductionBuildBinding{}, fmt.Errorf("Standard authoring production build binding is unavailable; build with scripts/build-codeedge-production.sh: %w", err)
 	}
 	return binding, nil
+}
+
+func workflowkitFingerprint(value string) workflowkit.Fingerprint {
+	return workflowkit.Fingerprint(value)
 }

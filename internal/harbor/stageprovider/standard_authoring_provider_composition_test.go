@@ -68,7 +68,7 @@ func TestStandardAuthoringProviderCompositionRejectsDifferentTemplateAndContaine
 		t.Fatal(err)
 	}
 	_, err = NewStandardAuthoringProviderComposition(StandardAuthoringProviderCompositionConfig{
-		Template: workflowadapter.CodeEdgePhase1TemplateReference(), Catalog: catalog, Lock: lock, Attestor: attestor,
+		Template: workflowadapter.StandardTemplateReference(), Catalog: catalog, Lock: lock, Attestor: attestor,
 		Handlers: StandardAuthoringOperationHandlers{HarborBuiltin: HarborBuiltinOperationExecutorFunc(func(context.Context, StageOperationInvocation, workflowadapter.HarborBuiltinOperationPayload) (workflowkit.StageExecutionResult, error) {
 			return workflowkit.StageExecutionResult{}, nil
 		})},

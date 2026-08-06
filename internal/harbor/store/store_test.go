@@ -774,22 +774,22 @@ func TestOpenAndOpenReadOnlyRejectConsolidatedV2StructuralDriftWithoutRepair(t *
 		objectName string
 	}{
 		{
-			name:       "handoff_immutability_trigger",
-			dropSQL:    `DROP TRIGGER codeedge_evaluator_evidence_handoffs_v2_immutable`,
+			name:       "transcript_immutability_trigger",
+			dropSQL:    `DROP TRIGGER agent_turn_transcripts_no_delete`,
 			objectType: "trigger",
-			objectName: "codeedge_evaluator_evidence_handoffs_v2_immutable",
+			objectName: "agent_turn_transcripts_no_delete",
 		},
 		{
-			name:       "handoff_identity_registry_trigger",
-			dropSQL:    `DROP TRIGGER entity_id_registry_codeedge_evaluator_evidence_handoffs_v2_insert`,
+			name:       "authoring_session_identity_registry_trigger",
+			dropSQL:    `DROP TRIGGER entity_id_registry_authoring_sessions_v2_insert`,
 			objectType: "trigger",
-			objectName: "entity_id_registry_codeedge_evaluator_evidence_handoffs_v2_insert",
+			objectName: "entity_id_registry_authoring_sessions_v2_insert",
 		},
 		{
-			name:       "handoff_lookup_index",
-			dropSQL:    `DROP INDEX idx_codeedge_evaluator_handoff_v2_task`,
+			name:       "transcript_expiry_index",
+			dropSQL:    `DROP INDEX idx_agent_turn_transcripts_expiry`,
 			objectType: "index",
-			objectName: "idx_codeedge_evaluator_handoff_v2_task",
+			objectName: "idx_agent_turn_transcripts_expiry",
 		},
 	}
 

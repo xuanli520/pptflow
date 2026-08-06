@@ -121,7 +121,7 @@ func TestLocalFilesystemRuntimeAttestorFailsClosedForNonLocalOperations(t *testi
 	}{
 		{
 			name:        "container command",
-			attestation: operationCatalogLockRuntimeAttestation(t, operationCatalogLockTestResolution(t, workflowadapter.HarborRunQwen)),
+			attestation: operationCatalogLockRuntimeAttestation(t, containerCommandRuntimeAttestationResolution(t)),
 		},
 		{
 			name:        "agent turn",
@@ -129,7 +129,7 @@ func TestLocalFilesystemRuntimeAttestorFailsClosedForNonLocalOperations(t *testi
 		},
 		{
 			name:        "durable review",
-			attestation: operationCatalogLockRuntimeAttestation(t, operationCatalogLockTestResolution(t, workflowadapter.ResultReview)),
+			attestation: operationCatalogLockRuntimeAttestation(t, operationCatalogLockTestResolution(t, workflowadapter.FinalReview)),
 		},
 	}
 
@@ -224,6 +224,16 @@ func agentTurnRuntimeAttestationResolution(t *testing.T) workflowadapter.StageOp
 	resolution := operationCatalogLockTestResolution(t, workflowadapter.RepoPrepare)
 	resolution.Operation.Payload = workflowadapter.AgentTurnOperationPayload{
 		AgentID: "codeedge-agent", ModelID: "codeedge-model", ReasoningEffort: workflowadapter.AgentReasoningEffortHigh, MaxTurns: 4,
+	}
+	return resolution
+}
+
+func containerCommandRuntimeAttestationResolution(t *testing.T) workflowadapter.StageOperationResolution {
+	t.Helper()
+	resolution := operationCatalogLockTestResolution(t, workflowadapter.RepoPrepare)
+	resolution.Operation.Payload = workflowadapter.ContainerCommandOperationPayload{
+		ImageDigest: "registry.example/harbor/evaluator@sha256:" + strings.Repeat("a", 64),
+		Command:     []string{"harbor-evaluator"},
 	}
 	return resolution
 }

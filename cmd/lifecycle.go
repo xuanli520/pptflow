@@ -205,23 +205,21 @@ func lifecycleMutationCheckpointForKey(ctx context.Context, services *app.Lifecy
 		return app.LifecycleMutationCheckpoint{}, false, fmt.Errorf("%w: prepared legacy lifecycle operation %s has no persisted expected checkpoint identities", store.ErrIdempotencyConflict, operation.ID)
 	}
 	checkpoint := app.LifecycleMutationCheckpoint{
-		TaskID:                           operation.ExpectedTaskID,
-		TaskVersion:                      operation.ExpectedTaskVersion,
-		RevisionID:                       operation.ExpectedRevisionID,
-		RevisionStateVersion:             operation.ExpectedRevisionStateVersion,
-		RevisionDigest:                   operation.ExpectedRevisionDigest,
-		RunID:                            operation.ExpectedRunID,
-		RunVersion:                       operation.ExpectedRunVersion,
-		RunExecutionEpoch:                operation.ExpectedRunExecutionEpoch,
-		RunDefinitionHash:                operation.ExpectedRunDefinitionHash,
-		CodeEdgeComplianceRecordID:       operation.ExpectedCodeEdgeComplianceRecordID,
-		CodeEdgeAuthorizationFingerprint: operation.ExpectedCodeEdgeAuthorizationFingerprint,
-		ReleaseID:                        operation.ExpectedReleaseID,
-		ReleaseRecordVersion:             operation.ExpectedReleaseRecordVersion,
-		ReviewRequestID:                  operation.ExpectedReviewRequestID,
-		ReviewRevisionID:                 operation.ExpectedReviewRevisionID,
-		ReviewState:                      operation.ExpectedReviewState,
-		ReviewEvidenceDigest:             operation.ExpectedReviewEvidenceDigest,
+		TaskID:               operation.ExpectedTaskID,
+		TaskVersion:          operation.ExpectedTaskVersion,
+		RevisionID:           operation.ExpectedRevisionID,
+		RevisionStateVersion: operation.ExpectedRevisionStateVersion,
+		RevisionDigest:       operation.ExpectedRevisionDigest,
+		RunID:                operation.ExpectedRunID,
+		RunVersion:           operation.ExpectedRunVersion,
+		RunExecutionEpoch:    operation.ExpectedRunExecutionEpoch,
+		RunDefinitionHash:    operation.ExpectedRunDefinitionHash,
+		ReleaseID:            operation.ExpectedReleaseID,
+		ReleaseRecordVersion: operation.ExpectedReleaseRecordVersion,
+		ReviewRequestID:      operation.ExpectedReviewRequestID,
+		ReviewRevisionID:     operation.ExpectedReviewRevisionID,
+		ReviewState:          operation.ExpectedReviewState,
+		ReviewEvidenceDigest: operation.ExpectedReviewEvidenceDigest,
 	}
 	return checkpoint, true, nil
 }
@@ -1164,7 +1162,6 @@ func newRunCommandV2(config *lifecycleCLIConfig) *cobra.Command {
 	command := &cobra.Command{Use: "run", Short: "Create and inspect frozen workflow runs", Args: cobra.NoArgs, RunE: showCommandGroupHelp}
 	command.AddCommand(
 		newRunStartCommand(config),
-		newRunEvaluateCommand(config),
 		newRunShowCommand(config),
 		newRunSummaryCommand(config),
 		newRunListCommand(config),
@@ -1180,290 +1177,6 @@ func newRunCommandV2(config *lifecycleCLIConfig) *cobra.Command {
 		newRunWorkerCommand(config),
 	)
 	return command
-}
-
-// newRunEvaluateCommand exposes only the closed CodeEdge evaluator child
-// workflow. Unlike generic run start, its profile/spec/model/provider choices
-// are supplied by the deployment-composed application service, never flags.
-func newRunEvaluateCommand(config *lifecycleCLIConfig) *cobra.Command {
-	return newRunEvaluateCommandWithLauncher(config, executableRunWorkerLauncher{})
-}
-
-func newRunEvaluateCommandWithLauncher(config *lifecycleCLIConfig, launcher app.RunWorkerHandoffLauncher) *cobra.Command {
-	command := &cobra.Command{
-		Use:   "evaluate",
-		Short: "Launch the strict CodeEdge evaluator child workflow",
-		Args:  cobra.NoArgs,
-		RunE:  showCommandGroupHelp,
-	}
-	command.AddCommand(
-		newRunEvaluatePrepareCommand(config),
-		newRunEvaluateConfirmCommand(config, launcher),
-		newRunEvaluateAdoptEvidenceCommand(config),
-	)
-	return command
-}
-
-// newRunEvaluateAdoptEvidenceCommand exposes the parent-side adoption of a
-// completed evaluator child. It accepts only durable Run identities; all
-// result bundles, trial identities, screenshots, and fingerprints are rebuilt
-// by the application service from the child Run's immutable lineage.
-func newRunEvaluateAdoptEvidenceCommand(config *lifecycleCLIConfig) *cobra.Command {
-	command := &cobra.Command{
-		Use:   "adopt-evidence",
-		Short: "Adopt verified evidence from a completed CodeEdge evaluator child Run",
-		Args:  cobra.NoArgs,
-		RunE:  showCommandGroupHelp,
-	}
-	command.AddCommand(
-		newRunEvaluateAdoptEvidencePrepareCommand(config),
-		newRunEvaluateAdoptEvidenceConfirmCommand(config),
-	)
-	return command
-}
-
-func newRunEvaluateAdoptEvidencePrepareCommand(config *lifecycleCLIConfig) *cobra.Command {
-	var parentRunID, childRunID, idempotencyKey, reason string
-	command := &cobra.Command{
-		Use:   "prepare",
-		Short: "Verify and freeze a CodeEdge evaluator evidence-adoption confirmation",
-		Args:  cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			actor, reason, err := lifecycleActorAndReason(config, reason)
-			if err != nil {
-				return err
-			}
-			if err := requireCodeEdgeEvaluatorEvidenceHandoffRunIDs(parentRunID, childRunID); err != nil {
-				return err
-			}
-			idempotencyKey, err = requiredLifecycleIdempotencyKey(idempotencyKey)
-			if err != nil {
-				return err
-			}
-			return executeLifecycleCommand(cmd, config, func(ctx context.Context, services *app.LifecycleServices) (any, error) {
-				checkpoint, _, checkpointErr := captureCodeEdgeEvaluatorEvidenceHandoffCheckpoint(ctx, services, parentRunID, idempotencyKey)
-				if checkpointErr != nil {
-					return nil, checkpointErr
-				}
-				if services.Mutations == nil {
-					return nil, fmt.Errorf("CodeEdge evaluator evidence handoff lifecycle service is not configured")
-				}
-				return services.Mutations.PrepareCodeEdgeEvaluatorEvidenceHandoff(ctx, app.CodeEdgeEvaluatorEvidenceHandoffCommand{
-					LifecycleMutationCommandBase: lifecycleMutationBase(idempotencyKey, actor, reason, checkpoint),
-					ParentRunID:                  parentRunID,
-					ChildRunID:                   childRunID,
-				})
-			})
-		},
-	}
-	command.Flags().StringVar(&parentRunID, "parent-run", "", "Approved CodeEdge Phase-1 parent Run UUIDv7")
-	command.Flags().StringVar(&childRunID, "child-run", "", "Succeeded CodeEdge evaluator child Run UUIDv7")
-	command.Flags().StringVar(&idempotencyKey, "idempotency-key", "", "Client-generated UUIDv7 evidence-adoption idempotency key")
-	command.Flags().StringVar(&reason, "reason", "", "Audit reason frozen by the evidence-adoption confirmation")
-	return command
-}
-
-func newRunEvaluateAdoptEvidenceConfirmCommand(config *lifecycleCLIConfig) *cobra.Command {
-	var parentRunID, childRunID, idempotencyKey, reason string
-	command := &cobra.Command{
-		Use:   "confirm",
-		Short: "Confirm a prepared CodeEdge evaluator evidence adoption",
-		Args:  cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			actor, reason, err := lifecycleActorAndReason(config, reason)
-			if err != nil {
-				return err
-			}
-			if err := requireCodeEdgeEvaluatorEvidenceHandoffRunIDs(parentRunID, childRunID); err != nil {
-				return err
-			}
-			idempotencyKey, err = requiredLifecycleIdempotencyKey(idempotencyKey)
-			if err != nil {
-				return err
-			}
-			return executeLifecycleCommand(cmd, config, func(ctx context.Context, services *app.LifecycleServices) (any, error) {
-				checkpoint, prepared, checkpointErr := captureCodeEdgeEvaluatorEvidenceHandoffCheckpoint(ctx, services, parentRunID, idempotencyKey)
-				if checkpointErr != nil {
-					return nil, checkpointErr
-				}
-				if !prepared {
-					return nil, fmt.Errorf("CodeEdge evaluator evidence handoff must be prepared with the same idempotency key before confirmation")
-				}
-				if services.Mutations == nil {
-					return nil, fmt.Errorf("CodeEdge evaluator evidence handoff lifecycle service is not configured")
-				}
-				return services.Mutations.AdoptCodeEdgeEvaluatorEvidenceHandoff(ctx, app.CodeEdgeEvaluatorEvidenceHandoffCommand{
-					LifecycleMutationCommandBase: lifecycleMutationBase(idempotencyKey, actor, reason, checkpoint),
-					ParentRunID:                  parentRunID,
-					ChildRunID:                   childRunID,
-				})
-			})
-		},
-	}
-	command.Flags().StringVar(&parentRunID, "parent-run", "", "Approved CodeEdge Phase-1 parent Run UUIDv7")
-	command.Flags().StringVar(&childRunID, "child-run", "", "Succeeded CodeEdge evaluator child Run UUIDv7")
-	command.Flags().StringVar(&idempotencyKey, "idempotency-key", "", "Client-generated UUIDv7 evidence-adoption idempotency key")
-	command.Flags().StringVar(&reason, "reason", "", "Audit reason frozen by the prepared evidence-adoption confirmation")
-	return command
-}
-
-func requireCodeEdgeEvaluatorEvidenceHandoffRunIDs(parentRunID, childRunID string) error {
-	if _, err := requiredText("parent-run", parentRunID); err != nil {
-		return err
-	}
-	if err := store.ValidateUUIDv7(parentRunID); err != nil {
-		return fmt.Errorf("parent-run must be a UUIDv7: %w", err)
-	}
-	if _, err := requiredText("child-run", childRunID); err != nil {
-		return err
-	}
-	if err := store.ValidateUUIDv7(childRunID); err != nil {
-		return fmt.Errorf("child-run must be a UUIDv7: %w", err)
-	}
-	return nil
-}
-
-func newRunEvaluatePrepareCommand(config *lifecycleCLIConfig) *cobra.Command {
-	var parentRunID, idempotencyKey, reason string
-	command := &cobra.Command{
-		Use:   "prepare",
-		Short: "Freeze a CodeEdge evaluator child plan without starting a worker",
-		Args:  cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			actor, reason, err := lifecycleActorAndReason(config, reason)
-			if err != nil {
-				return err
-			}
-			if _, err := requiredText("parent-run", parentRunID); err != nil {
-				return err
-			}
-			if err := store.ValidateUUIDv7(parentRunID); err != nil {
-				return fmt.Errorf("parent-run must be a UUIDv7: %w", err)
-			}
-			idempotencyKey, err = requiredLifecycleIdempotencyKey(idempotencyKey)
-			if err != nil {
-				return err
-			}
-			return executeLifecycleCommand(cmd, config, func(ctx context.Context, services *app.LifecycleServices) (any, error) {
-				checkpoint, err := captureCodeEdgeEvaluatorLaunchCheckpoint(ctx, services, parentRunID, idempotencyKey)
-				if err != nil {
-					return nil, err
-				}
-				if services.EvaluatorLaunches == nil {
-					return nil, fmt.Errorf("CodeEdge evaluator launch service is not configured")
-				}
-				return services.EvaluatorLaunches.Prepare(ctx, app.CodeEdgeEvaluatorLaunchCommand{
-					LifecycleMutationCommandBase: lifecycleMutationBase(idempotencyKey, actor, reason, checkpoint),
-					ParentRunID:                  parentRunID,
-				})
-			})
-		},
-	}
-	command.Flags().StringVar(&parentRunID, "parent-run", "", "Approved CodeEdge Phase-1 parent Run UUIDv7")
-	command.Flags().StringVar(&idempotencyKey, "idempotency-key", "", "Client-generated UUIDv7 evaluator launch idempotency key")
-	command.Flags().StringVar(&reason, "reason", "", "Audit reason for the evaluator launch")
-	return command
-}
-
-func newRunEvaluateConfirmCommand(config *lifecycleCLIConfig, launcher app.RunWorkerHandoffLauncher) *cobra.Command {
-	var parentRunID, idempotencyKey, reason string
-	command := &cobra.Command{
-		Use:   "confirm",
-		Short: "Confirm a frozen CodeEdge evaluator plan and start its controlled worker",
-		Args:  cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			actor, reason, err := lifecycleActorAndReason(config, reason)
-			if err != nil {
-				return err
-			}
-			if _, err := requiredText("parent-run", parentRunID); err != nil {
-				return err
-			}
-			if err := store.ValidateUUIDv7(parentRunID); err != nil {
-				return fmt.Errorf("parent-run must be a UUIDv7: %w", err)
-			}
-			idempotencyKey, err = requiredLifecycleIdempotencyKey(idempotencyKey)
-			if err != nil {
-				return err
-			}
-			if launcher == nil {
-				return fmt.Errorf("CodeEdge evaluator controlled worker launcher is not configured")
-			}
-			return executeLifecycleCommand(cmd, config, func(ctx context.Context, services *app.LifecycleServices) (any, error) {
-				checkpoint, err := captureCodeEdgeEvaluatorLaunchCheckpoint(ctx, services, parentRunID, idempotencyKey)
-				if err != nil {
-					return nil, err
-				}
-				if services.EvaluatorLaunches == nil {
-					return nil, fmt.Errorf("CodeEdge evaluator launch service is not configured")
-				}
-				return services.EvaluatorLaunches.ConfirmAndLaunch(ctx, app.CodeEdgeEvaluatorLaunchCommand{
-					LifecycleMutationCommandBase: lifecycleMutationBase(idempotencyKey, actor, reason, checkpoint),
-					ParentRunID:                  parentRunID,
-				}, launcher)
-			})
-		},
-	}
-	command.Flags().StringVar(&parentRunID, "parent-run", "", "Approved CodeEdge Phase-1 parent Run UUIDv7")
-	command.Flags().StringVar(&idempotencyKey, "idempotency-key", "", "Client-generated UUIDv7 evaluator launch idempotency key")
-	command.Flags().StringVar(&reason, "reason", "", "Audit reason frozen by the prepared evaluator plan")
-	return command
-}
-
-// captureCodeEdgeEvaluatorLaunchCheckpoint restores the original parent Run
-// checkpoint for a prepared/completed request. New prepare requests capture
-// the parent identity immediately; confirm never substitutes a newer parent
-// Run after the operator inspected the first confirmation.
-func captureCodeEdgeEvaluatorLaunchCheckpoint(ctx context.Context, services *app.LifecycleServices, parentRunID, idempotencyKey string) (app.LifecycleMutationCheckpoint, error) {
-	if services == nil || services.Mutations == nil || services.Runs == nil {
-		return app.LifecycleMutationCheckpoint{}, fmt.Errorf("CodeEdge evaluator lifecycle services are not configured")
-	}
-	checkpoint, replayed, err := lifecycleMutationCheckpointForKey(ctx, services, app.LifecycleMutationCodeEdgeEvaluator, idempotencyKey)
-	if err != nil {
-		return app.LifecycleMutationCheckpoint{}, err
-	}
-	if !replayed {
-		parent, err := services.Runs.Get(ctx, parentRunID)
-		if err != nil {
-			return app.LifecycleMutationCheckpoint{}, err
-		}
-		checkpoint, err = services.Mutations.CaptureCheckpoint(ctx, parent.TaskID, parent.RevisionID, parent.ID, "")
-		if err != nil {
-			return app.LifecycleMutationCheckpoint{}, err
-		}
-	}
-	if err := requireLifecycleCheckpointIdentity("parent-run", parentRunID, checkpoint.RunID); err != nil {
-		return app.LifecycleMutationCheckpoint{}, err
-	}
-	return checkpoint, nil
-}
-
-// captureCodeEdgeEvaluatorEvidenceHandoffCheckpoint restores the original
-// parent checkpoint from the first confirmation. A new prepare captures it
-// exactly once; confirm never substitutes whatever parent Run happens to be
-// current after the operator inspected the handoff plan.
-func captureCodeEdgeEvaluatorEvidenceHandoffCheckpoint(ctx context.Context, services *app.LifecycleServices, parentRunID, idempotencyKey string) (app.LifecycleMutationCheckpoint, bool, error) {
-	if services == nil || services.Mutations == nil || services.Runs == nil {
-		return app.LifecycleMutationCheckpoint{}, false, fmt.Errorf("CodeEdge evaluator evidence handoff lifecycle services are not configured")
-	}
-	checkpoint, persisted, err := lifecycleMutationCheckpointForKey(ctx, services, app.LifecycleMutationCodeEdgeEvaluatorEvidenceHandoff, idempotencyKey)
-	if err != nil {
-		return app.LifecycleMutationCheckpoint{}, false, err
-	}
-	if !persisted {
-		parent, getErr := services.Runs.Get(ctx, parentRunID)
-		if getErr != nil {
-			return app.LifecycleMutationCheckpoint{}, false, getErr
-		}
-		checkpoint, err = services.Mutations.CaptureCheckpoint(ctx, parent.TaskID, parent.RevisionID, parent.ID, "")
-		if err != nil {
-			return app.LifecycleMutationCheckpoint{}, false, err
-		}
-	}
-	if err := requireLifecycleCheckpointIdentity("parent-run", parentRunID, checkpoint.RunID); err != nil {
-		return app.LifecycleMutationCheckpoint{}, false, err
-	}
-	return checkpoint, persisted, nil
 }
 
 func newRunStartCommand(config *lifecycleCLIConfig) *cobra.Command {
@@ -1731,7 +1444,7 @@ func newReleasePackageCommand(config *lifecycleCLIConfig) *cobra.Command {
 		},
 	}
 	command.Flags().StringVar(&revisionID, "revision", "", "Validated current revision UUIDv7")
-	command.Flags().StringVar(&runID, "run", "", "Approved CodeEdge Phase-1 Run UUIDv7 when this revision has CodeEdge execution")
+	command.Flags().StringVar(&runID, "run", "", "Approved workflow run UUIDv7 bound to this release")
 	command.Flags().Int64Var(&expectedStateVersion, "expected-state-version", 0, "Current revision state version")
 	command.Flags().StringVar(&version, "version", "", "Globally unique local release version")
 	command.Flags().StringVar(&idempotencyKey, "idempotency-key", "", "Client-generated UUIDv7 lifecycle idempotency key")

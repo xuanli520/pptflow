@@ -318,7 +318,7 @@ func TestOpenDoesNotRestoreNonConsolidatedV2Backup(t *testing.T) {
 		{
 			name: "missing_required_baseline_table",
 			mutate: func(db *sql.DB) error {
-				_, err := db.Exec(`DROP TABLE codeedge_compliance_records_v20`)
+				_, err := db.Exec(`DROP TABLE authoring_sessions_v2`)
 				return err
 			},
 			want: ErrPreConsolidationStore,

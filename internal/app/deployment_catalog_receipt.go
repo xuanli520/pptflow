@@ -36,9 +36,8 @@ type DeploymentCatalogReceiptResolver interface {
 // DeploymentCatalogLockIdentityResolver exposes the immutable lock identity
 // of the installed deployment catalog at runtime. The stageprovider
 // CatalogLockAttestedWorkflowkitProviderOperationResolver implements this
-// contract so CodeEdge compliance and evidence inspection can name the
-// concrete lock currently installed for a template without persisting a
-// per-Run frozen identity.
+// contract so callers can name the concrete lock currently installed for a
+// template without persisting a per-Run frozen identity.
 //
 // It deliberately remains separate from DeploymentCatalogReceiptResolver so
 // catalog-only and non-production compositions do not acquire a fabricated
@@ -51,8 +50,7 @@ type DeploymentCatalogLockIdentityResolver interface {
 // TemplateDeploymentCatalogResolver installs one immutable deployment catalog
 // (and, when supported by Resolver, its immutable operation lock) for exactly
 // one closed workflow template. The explicit template key prevents a catalog
-// for a CodeEdge parent Run from authorizing its evaluator child, or vice
-// versa.
+// for one template from authorizing a Run of another template.
 //
 // Resolver's receipt must name exactly Template. NewLifecycleServicesWithOptions
 // rejects a mismatch during composition rather than deferring it to a later
@@ -112,20 +110,6 @@ func (registry *deploymentCatalogRegistry) bindingFor(template workflowadapter.T
 	}
 	binding, present := registry.bindings[template]
 	return binding, present
-}
-
-// soleBinding preserves the legacy single-resolver composition only for
-// cross-Run CodeEdge evidence inspection. It must never be used by StartRun,
-// replay, or worker admission, where a catalog from another template would be
-// an unsafe fallback.
-func (registry *deploymentCatalogRegistry) soleBinding() (*deploymentCatalogBinding, bool) {
-	if registry == nil || len(registry.bindings) != 1 {
-		return nil, false
-	}
-	for _, binding := range registry.bindings {
-		return binding, binding != nil
-	}
-	return nil, false
 }
 
 func newDeploymentCatalogBinding(resolver DeploymentCatalogReceiptResolver) (*deploymentCatalogBinding, error) {
@@ -201,17 +185,6 @@ func (core *lifecycleServiceCore) deploymentCatalogBindingForTemplate(template w
 		return nil, fmt.Errorf("%w: no configured deployment catalog binding for workflow template %s@%s", stageprovider.ErrDeploymentOperationCatalogUnavailable, template.ID, template.Version)
 	}
 	return binding, nil
-}
-
-// configuredDeploymentCatalogBindingForTemplate is the non-failing lookup
-// used only by cross-Run CodeEdge evidence inspection. Normal StartRun,
-// replay, and worker paths must use deploymentCatalogBindingForTemplate so an
-// unbound executable Run remains fail-closed.
-func (core *lifecycleServiceCore) configuredDeploymentCatalogBindingForTemplate(template workflowadapter.TemplateReference) (*deploymentCatalogBinding, bool) {
-	if core == nil || core.deploymentCatalogs == nil {
-		return nil, false
-	}
-	return core.deploymentCatalogs.bindingFor(template)
 }
 
 // frozenDeploymentCatalogReceipt returns the immutable receipt configured for

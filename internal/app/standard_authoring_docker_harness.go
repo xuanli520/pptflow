@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 
+	"io"
+
 	"github.com/purplevoid/harbor-factory/internal/harbor/authoringharness"
 	"github.com/purplevoid/harbor-factory/internal/harbor/stageprovider"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
@@ -19,6 +21,7 @@ import (
 
 const (
 	standardAuthoringDockerHarnessTailLimit           = 16 << 10
+	standardAuthoringVerificationScriptLimit          = 16 << 20
 	standardAuthoringDockerHarnessSourceAccessProgram = "rm -rf /work/* /work/.[!.]* /work/..?* 2>/dev/null || true; mkdir -p /work && cp -R /source/. /work/ && chmod -R u+rwX /work && test -d /work && probe=$(find /work -type f -print -quit) && test -n \"$probe\" && test -w \"$probe\" && touch /work/.harbor-source-access && rm /work/.harbor-source-access && if touch /source/.harbor-source-access 2>/dev/null; then rm -f /source/.harbor-source-access; exit 126; fi"
 )
 
@@ -30,7 +33,7 @@ var standardAuthoringDockerHarnessTokenPattern = regexp.MustCompile(`(?i)\b(?:sk
 type StandardAuthoringDockerHarnessConfig struct {
 	ManagedRoot        string
 	LockedCommands     []stageprovider.LocalExecutableLock
-	Runner             CodeEdgePhase1CommandRunner
+	Runner             lockedDockerCommandRunner
 	CommandTimeout     time.Duration
 	ExecutableAttestor func(context.Context, stageprovider.LocalExecutableLock) error
 }
@@ -60,7 +63,7 @@ func NewStandardAuthoringDockerHarness(config StandardAuthoringDockerHarnessConf
 	if err := ensureStandardAuthoringWorkspaceRoot(authoringWorkspaceRoot); err != nil {
 		return nil, err
 	}
-	commands, err := codeEdgePhase1LockedCommands(config.LockedCommands)
+	commands, err := standardAuthoringLockedCommands(config.LockedCommands)
 	if err != nil {
 		return nil, fmt.Errorf("construct Standard authoring Docker command registry: %w", err)
 	}
@@ -292,7 +295,7 @@ func (harness *StandardAuthoringDockerHarness) ensureCandidateImage(ctx context.
 		"--file", filepath.Join(environmentRoot, "Dockerfile"),
 		environmentRoot,
 	}
-	commandResult, fingerprint, runErr := harness.docker.run(ctx, stageprovider.CodeEdgePhase1DockerBuildCommandID, args, invocationRoot)
+	commandResult, fingerprint, runErr := harness.docker.run(ctx, stageprovider.StandardAuthoringDockerBuildCommandID, args, invocationRoot)
 	if runErr != nil && isStandardAuthoringHarnessFatalCommandError(ctx, runErr) {
 		return standardAuthoringHarnessImageReceipt{}, authoringharness.StepResult{}, false, runErr
 	}
@@ -307,7 +310,7 @@ func (harness *StandardAuthoringDockerHarness) ensureCandidateImage(ctx context.
 	if !passed {
 		return standardAuthoringHarnessImageReceipt{}, step, false, nil
 	}
-	imageID, inspected, inspectFingerprint, inspectErr := harness.docker.inspectImage(ctx, invocationRoot, stageprovider.CodeEdgePhase1DockerBuildCommandID, imageTag)
+	imageID, inspected, inspectFingerprint, inspectErr := harness.docker.inspectImage(ctx, invocationRoot, stageprovider.StandardAuthoringDockerBuildCommandID, imageTag)
 	if inspectErr != nil {
 		if isStandardAuthoringHarnessFatalCommandError(ctx, inspectErr) {
 			return standardAuthoringHarnessImageReceipt{}, authoringharness.StepResult{}, false, inspectErr
@@ -326,7 +329,7 @@ func (harness *StandardAuthoringDockerHarness) ensureCandidateImage(ctx context.
 // successful image build alone is insufficient because source archive modes
 // can make the read-only source mount unavailable after capabilities are dropped.
 func (harness *StandardAuthoringDockerHarness) runSourceAccess(ctx context.Context, image standardAuthoringHarnessImageReceipt, invocationRoot, sourceRoot string) (authoringharness.StepResult, error) {
-	if step, ok, err := harness.reattestImage(ctx, invocationRoot, stageprovider.CodeEdgePhase1DockerBuildCommandID, image); err != nil || !ok {
+	if step, ok, err := harness.reattestImage(ctx, invocationRoot, stageprovider.StandardAuthoringDockerBuildCommandID, image); err != nil || !ok {
 		return step, err
 	}
 	stageRoot := filepath.Join(invocationRoot, "verification", "source-access")
@@ -338,17 +341,17 @@ func (harness *StandardAuthoringDockerHarness) runSourceAccess(ctx context.Conte
 	if err := ensureStandardAuthoringHarnessDirectory(stageRoot); err != nil {
 		return authoringharness.StepResult{}, fmt.Errorf("prepare Standard authoring source-access verification root: %w", err)
 	}
-	if err := codeEdgePhase1PrepareVerificationCheckoutRoot(taskRoot); err != nil {
+	if err := standardAuthoringPrepareVerificationCheckoutRoot(taskRoot); err != nil {
 		return authoringharness.StepResult{}, err
 	}
-	if err := codeEdgePhase1PrepareVerificationCheckoutRoot(workRoot); err != nil {
+	if err := standardAuthoringPrepareVerificationCheckoutRoot(workRoot); err != nil {
 		return authoringharness.StepResult{}, err
 	}
 	containerID, err := store.NewUUIDv7()
 	if err != nil {
 		return authoringharness.StepResult{}, err
 	}
-	result, fingerprint, runErr := harness.docker.run(ctx, stageprovider.CodeEdgePhase1DockerBuildCommandID,
+	result, fingerprint, runErr := harness.docker.run(ctx, stageprovider.StandardAuthoringDockerBuildCommandID,
 		standardAuthoringDockerRunArgs(image.ImageTag, taskRoot, sourceRoot, workRoot, "authoring-source-access-"+containerID, standardAuthoringDockerHarnessSourceAccessProgram), invocationRoot)
 	if runErr != nil && isStandardAuthoringHarnessFatalCommandError(ctx, runErr) {
 		return authoringharness.StepResult{}, runErr
@@ -370,7 +373,7 @@ func (harness *StandardAuthoringDockerHarness) runSourceAccess(ctx context.Conte
 // candidate's test script, although that script may be explicitly named by the
 // frozen command as a test harness input.
 func (harness *StandardAuthoringDockerHarness) runV3Baseline(ctx context.Context, request authoringharness.Request, image standardAuthoringHarnessImageReceipt, invocationRoot, snapshotRoot, sourceRoot string, verification StandardAuthoringVerificationContract) (authoringharness.StepResult, error) {
-	if step, ok, err := harness.reattestImage(ctx, invocationRoot, stageprovider.CodeEdgePhase1InitialVerifyCommandID, image); err != nil || !ok {
+	if step, ok, err := harness.reattestImage(ctx, invocationRoot, stageprovider.StandardAuthoringInitialVerifyCommandID, image); err != nil || !ok {
 		return step, err
 	}
 	stageRoot := filepath.Join(invocationRoot, "verification", "initial")
@@ -380,14 +383,14 @@ func (harness *StandardAuthoringDockerHarness) runV3Baseline(ctx context.Context
 	if err != nil {
 		return authoringharness.StepResult{}, err
 	}
-	if err := codeEdgePhase1PrepareVerificationCheckoutRoot(workRoot); err != nil {
+	if err := standardAuthoringPrepareVerificationCheckoutRoot(workRoot); err != nil {
 		return authoringharness.StepResult{}, err
 	}
 	containerID, err := store.NewUUIDv7()
 	if err != nil {
 		return authoringharness.StepResult{}, err
 	}
-	result, fingerprint, runErr := harness.docker.run(ctx, stageprovider.CodeEdgePhase1InitialVerifyCommandID,
+	result, fingerprint, runErr := harness.docker.run(ctx, stageprovider.StandardAuthoringInitialVerifyCommandID,
 		standardAuthoringDockerRunArgs(image.ImageTag, taskRoot, sourceRoot, workRoot, "authoring-v3-initial-"+containerID, standardAuthoringV3VerificationProgram(verification, false)), invocationRoot)
 	if runErr != nil && isStandardAuthoringHarnessFatalCommandError(ctx, runErr) {
 		return authoringharness.StepResult{}, runErr
@@ -411,7 +414,7 @@ func (harness *StandardAuthoringDockerHarness) runV3Baseline(ctx context.Context
 // has been applied. The checkout name is host-selected so coverage verification
 // cannot reuse or observe the Oracle checkout.
 func (harness *StandardAuthoringDockerHarness) runV3Oracle(ctx context.Context, request authoringharness.Request, image standardAuthoringHarnessImageReceipt, invocationRoot, snapshotRoot, sourceRoot string, verification StandardAuthoringVerificationContract, checkoutName string) (authoringharness.StepResult, error) {
-	if step, ok, err := harness.reattestImage(ctx, invocationRoot, stageprovider.CodeEdgePhase1OracleVerifyCommandID, image); err != nil || !ok {
+	if step, ok, err := harness.reattestImage(ctx, invocationRoot, stageprovider.StandardAuthoringOracleVerifyCommandID, image); err != nil || !ok {
 		return step, err
 	}
 	stageRoot := filepath.Join(invocationRoot, "verification", checkoutName)
@@ -421,14 +424,14 @@ func (harness *StandardAuthoringDockerHarness) runV3Oracle(ctx context.Context, 
 	if err != nil {
 		return authoringharness.StepResult{}, err
 	}
-	if err := codeEdgePhase1PrepareVerificationCheckoutRoot(workRoot); err != nil {
+	if err := standardAuthoringPrepareVerificationCheckoutRoot(workRoot); err != nil {
 		return authoringharness.StepResult{}, err
 	}
 	containerID, err := store.NewUUIDv7()
 	if err != nil {
 		return authoringharness.StepResult{}, err
 	}
-	result, fingerprint, runErr := harness.docker.run(ctx, stageprovider.CodeEdgePhase1OracleVerifyCommandID,
+	result, fingerprint, runErr := harness.docker.run(ctx, stageprovider.StandardAuthoringOracleVerifyCommandID,
 		standardAuthoringDockerRunArgs(image.ImageTag, taskRoot, sourceRoot, workRoot, "authoring-v3-"+checkoutName+"-"+containerID, standardAuthoringV3VerificationProgram(verification, true)), invocationRoot)
 	if runErr != nil && isStandardAuthoringHarnessFatalCommandError(ctx, runErr) {
 		return authoringharness.StepResult{}, runErr
@@ -545,7 +548,47 @@ func standardAuthoringV3RegularFiles(root string) (map[string]workflowkit.Finger
 // through the current validation ABI. The host-owned work mount remains the
 // only writable tree so integrity checks can inspect it after Docker exits.
 func standardAuthoringDockerRunArgs(imageTag, taskRoot, sourceRoot, workRoot, name, shellProgram string) []string {
-	return codeEdgePhase1DockerRunArgs(imageTag, sourceRoot, taskRoot, workRoot, name, shellProgram)
+	args := []string{
+		"run", "--rm", "--network", "none", "--read-only", "--cap-drop", "ALL",
+		// Rust, Node, and similar build systems execute generated helper binaries
+		// from their temporary target/cache directories. Keep /tmp ephemeral and
+		// nosuid, but allow execution so verifier failures reflect task behavior
+		// rather than the container mount policy.
+		"--security-opt", "no-new-privileges", "--tmpfs", "/tmp:rw,exec,nosuid,size=2g",
+		"--env", "HOME=/tmp/harbor-home",
+		"--env", "XDG_CACHE_HOME=/tmp/harbor-cache",
+		"--env", "XDG_CONFIG_HOME=/tmp/harbor-config",
+		"--env", "HARBOR_SOURCE=/source",
+		"--env", "HARBOR_WORKSPACE=/work",
+		"--env", "HARBOR_TASK_ROOT=/task",
+		// Verifiers publish their binary reward under /logs. Keep that
+		// protocol path ephemeral and constrained while the image root stays read-only.
+		"--tmpfs", "/logs:rw,noexec,nosuid,size=8m",
+		"--mount", "type=bind,src=" + sourceRoot + ",dst=/source,readonly",
+		"--mount", "type=bind,src=" + taskRoot + ",dst=/task,readonly",
+	}
+	if strings.TrimSpace(workRoot) == "" {
+		args = append(args, "--tmpfs", "/work:rw,exec,nosuid,size=4g")
+	} else {
+		args = append(args, "--mount", "type=bind,src="+workRoot+",dst=/work")
+	}
+	return append(args,
+		"--workdir", "/work", "--name", "harbor-codeedge-"+name,
+		"--entrypoint", "/bin/sh", imageTag, "-ec", shellProgram,
+	)
+}
+
+func standardAuthoringDockerImageID(raw []byte) (string, error) {
+	lines := strings.Fields(string(raw))
+	if len(lines) != 1 || !strings.HasPrefix(lines[0], "sha256:") || len(lines[0]) != len("sha256:")+64 {
+		return "", errors.New("Docker build image identity is malformed")
+	}
+	for _, value := range lines[0][len("sha256:"):] {
+		if !(value >= '0' && value <= '9') && !(value >= 'a' && value <= 'f') {
+			return "", errors.New("Docker build image identity is malformed")
+		}
+	}
+	return lines[0], nil
 }
 
 func (harness *StandardAuthoringDockerHarness) reattestImage(ctx context.Context, invocationRoot, commandID string, image standardAuthoringHarnessImageReceipt) (authoringharness.StepResult, bool, error) {
@@ -562,7 +605,7 @@ func (harness *StandardAuthoringDockerHarness) reattestImage(ctx context.Context
 	return authoringharness.StepResult{}, true, nil
 }
 
-func (harness *StandardAuthoringDockerHarness) commandStep(name string, result CodeEdgePhase1CommandResult, fingerprint workflowkit.Fingerprint, passed bool, findings []string) authoringharness.StepResult {
+func (harness *StandardAuthoringDockerHarness) commandStep(name string, result lockedDockerCommandResult, fingerprint workflowkit.Fingerprint, passed bool, findings []string) authoringharness.StepResult {
 	if findings == nil {
 		findings = []string{}
 	}
@@ -598,18 +641,18 @@ func copyStandardAuthoringHarnessScripts(checkout, snapshotRoot string, relative
 	if err := ensureStandardAuthoringHarnessDirectory(filepath.Dir(checkout)); err != nil {
 		return nil, fmt.Errorf("prepare Standard authoring verification parent: %w", err)
 	}
-	if err := codeEdgePhase1PrepareVerificationCheckoutRoot(checkout); err != nil {
+	if err := standardAuthoringPrepareVerificationCheckoutRoot(checkout); err != nil {
 		return nil, err
 	}
 	expected := make(map[string]workflowkit.Fingerprint, len(relativeFiles))
 	for _, relative := range relativeFiles {
-		content, digest, err := codeEdgePhase1ReadTaskScript(filepath.Join(snapshotRoot, filepath.FromSlash(relative)))
+		content, digest, err := standardAuthoringReadTaskScript(filepath.Join(snapshotRoot, filepath.FromSlash(relative)))
 		if err != nil {
 			return nil, err
 		}
 		destination := filepath.Join(checkout, filepath.FromSlash(relative))
 		directory := filepath.Dir(destination)
-		if err := codeEdgePhase1PrepareVerificationScriptDirectory(directory); err != nil {
+		if err := standardAuthoringPrepareVerificationScriptDirectory(directory); err != nil {
 			return nil, err
 		}
 		if err := writeNewBytesWithMode(destination, content, 0o444); err != nil {
@@ -621,7 +664,7 @@ func copyStandardAuthoringHarnessScripts(checkout, snapshotRoot string, relative
 }
 
 func verifyStandardAuthoringHarnessScripts(checkout string, expected map[string]workflowkit.Fingerprint) error {
-	return codeEdgePhase1VerifyCheckoutScripts(checkout, expected)
+	return standardAuthoringVerifyCheckoutScripts(checkout, expected)
 }
 
 func ensureStandardAuthoringHarnessDirectory(path string) error {
@@ -678,4 +721,60 @@ func standardAuthoringHarnessSafeError(err error) string {
 		return "command was canceled"
 	}
 	return "command process failed"
+}
+
+func standardAuthoringPrepareVerificationCheckoutRoot(path string) error {
+	if err := os.Mkdir(path, 0o777); err != nil && !errors.Is(err, os.ErrExist) {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return errors.New("Standard authoring verification checkout is unsafe")
+	}
+	return os.Chmod(path, 0o777|os.ModeSticky)
+}
+
+func standardAuthoringPrepareVerificationScriptDirectory(path string) error {
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return errors.New("Standard authoring verification script directory is unsafe")
+	}
+	return os.Chmod(path, 0o755)
+}
+
+func standardAuthoringReadTaskScript(path string) ([]byte, workflowkit.Fingerprint, error) {
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > standardAuthoringVerificationScriptLimit {
+		return nil, "", errors.New("Standard authoring verification script is unavailable")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, "", err
+	}
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
+		return nil, "", errors.New("Standard authoring verification script changed while opening")
+	}
+	content, err := io.ReadAll(io.LimitReader(file, standardAuthoringVerificationScriptLimit+1))
+	if err != nil || int64(len(content)) != info.Size() {
+		return nil, "", errors.New("Standard authoring verification script changed while reading")
+	}
+	if after, err := file.Stat(); err != nil || !after.Mode().IsRegular() || !os.SameFile(opened, after) || after.Size() != int64(len(content)) {
+		return nil, "", errors.New("Standard authoring verification script changed while reading")
+	}
+	return content, workflowkit.SHA256Fingerprint(content), nil
+}
+
+func standardAuthoringVerifyCheckoutScripts(checkout string, expected map[string]workflowkit.Fingerprint) error {
+	for relative, digest := range expected {
+		_, actual, err := standardAuthoringReadTaskScript(filepath.Join(checkout, filepath.FromSlash(relative)))
+		if err != nil || actual != digest {
+			return errors.New("Standard authoring verification checkout script changed")
+		}
+	}
+	return nil
 }

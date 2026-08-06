@@ -530,7 +530,7 @@ func verifyConsolidatedV2SQLiteFile(path string) error {
 	if err := rejectLegacyV1Database(db); err != nil {
 		return err
 	}
-	return validateConsolidatedV2BaselineDatabase(db, true)
+	return validateConsolidatedV2BaselineDatabase(db)
 }
 
 func openImmutableSQLiteFile(path string) (*sql.DB, error) {

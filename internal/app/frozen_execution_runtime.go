@@ -126,8 +126,6 @@ func (runtime *FrozenExecutionRuntime) handleDurableJobState(ctx context.Context
 		return runtime.handleContinuation(ctx, execution, job)
 	case "stage_attempt.execute":
 		return runtime.handleStageAttempt(ctx, execution, job)
-	case codeEdgeEvaluatorReconciliationCommandType:
-		return runtime.handleCodeEdgeEvaluatorReconciliation(ctx, execution, job)
 	case repairSessionAdvanceCommandType:
 		return runtime.handleRepairSessionAdvance(ctx, job)
 	case store.ReviewGateResolutionCommandType:
@@ -167,10 +165,6 @@ func (runtime *FrozenExecutionRuntime) ReconcileDurableJobRecoveries(ctx context
 		switch job.CommandType {
 		case "stage_attempt.execute":
 			if err := runtime.reconcileRecoveredStageJob(ctx, job); err != nil {
-				return err
-			}
-		case codeEdgeEvaluatorReconciliationCommandType:
-			if err := runtime.reconcileRecoveredCodeEdgeEvaluatorReconciliation(ctx, job); err != nil {
 				return err
 			}
 		case "workflow_run.execute":
@@ -268,24 +262,6 @@ func (runtime *FrozenExecutionRuntime) reconcileRecoveredStageJob(ctx context.Co
 	if err := runtime.validateStageAttemptPlanBinding(*attempt, payload); err != nil {
 		_, projected := runtime.failRuntimeJob(ctx, job, err)
 		return projected
-	}
-	if isCodeEdgeEvaluatorStage(run, stage) {
-		handled, reconcileErr := runtime.reconcileRecoveredCodeEdgeEvaluatorStage(ctx, job, run, frozen, payload, *attempt, stage)
-		if reconcileErr != nil {
-			return reconcileErr
-		}
-		currentRun, currentRunErr := runtime.core.store.GetWorkflowRun(ctx, run.ID)
-		if currentRunErr != nil {
-			return currentRunErr
-		}
-		if currentRun == nil {
-			_, projected := runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: recovered CodeEdge evaluator Run disappeared", ErrLifecycleNotFound))
-			return projected
-		}
-		run = *currentRun
-		if handled {
-			return nil
-		}
 	}
 	if attempt.ExecutionStatus == store.StageExecutionRunning || attempt.ExecutionStatus == store.StageExecutionInDoubt || attempt.ExecutionStatus == store.StageExecutionReconciling {
 		return runtime.reconcileLeaseLostStageAttempt(ctx, job, run, payload, *attempt)
@@ -1625,16 +1601,6 @@ func (runtime *FrozenExecutionRuntime) handleStageAttempt(ctx context.Context, e
 	if !found || transition.Disposition != workflowkit.DispositionSchedule {
 		return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: stage attempt is not scheduled by its frozen execution plan", ErrFrozenExecutionPayload))
 	}
-	isCodeEdgeEvaluator := isCodeEdgeEvaluatorStage(run, stage)
-	if isCodeEdgeEvaluator {
-		effect, effectErr := runtime.codeEdgeEvaluatorEffectAlreadyStarted(ctx, run, *loadedStageAttempt, stage)
-		if effectErr != nil {
-			return runtime.failRuntimeJob(ctx, job, effectErr)
-		}
-		if effect != nil && !(effect.State == store.SideEffectSucceeded && loadedStageAttempt.ExecutionStatus == store.StageExecutionCompleted) {
-			return runtime.projectCodeEdgeEvaluatorInDoubt(ctx, job, run, *loadedStageAttempt, stage, stageQuotaReservation{}, *effect, nil, "CodeEdge evaluator invocation fence was already started")
-		}
-	}
 	if loadedStageAttempt.ExecutionStatus == store.StageExecutionCompleted || loadedStageAttempt.ExecutionStatus == store.StageExecutionInfraFailed || loadedStageAttempt.ExecutionStatus == store.StageExecutionInterrupted || loadedStageAttempt.ExecutionStatus == store.StageExecutionCanceled {
 		return store.JobSucceeded, nil
 	}
@@ -1651,11 +1617,6 @@ func (runtime *FrozenExecutionRuntime) handleStageAttempt(ctx context.Context, e
 	}
 	if state, handled, controlErr := runtime.handlePreStageControl(ctx, job, run, stageAttempt); handled || controlErr != nil {
 		return state, controlErr
-	}
-	if isCodeEdgeEvaluator {
-		if err := validateCodeEdgeEvaluatorBudget(stage); err != nil {
-			return runtime.failRuntimeJob(ctx, job, err)
-		}
 	}
 	if stageAttempt.ExecutionStatus == store.StageExecutionQueued {
 		stageAttempt, err = runtime.core.store.TransitionStageAttempt(ctx, store.TransitionStageAttemptRequest{
@@ -1721,24 +1682,10 @@ func (runtime *FrozenExecutionRuntime) handleStageAttempt(ctx context.Context, e
 	if string(inputFingerprint) != stageAttempt.InputFingerprint {
 		return runtime.failAdmittedStageIntegrity(ctx, job, stageAttempt, reservation, execution.LeaseLost, fmt.Errorf("%w: stage attempt input fingerprint drift", ErrFrozenExecutionPayload))
 	}
-	var codeEdgeEffect *store.SideEffectOperation
-	if isCodeEdgeEvaluator {
-		fence, fenceErr := runtime.prepareCodeEdgeEvaluatorEffect(ctx, job, run, stageAttempt, stage)
-		if fenceErr != nil {
-			return runtime.failAdmittedStageIntegrity(ctx, job, stageAttempt, reservation, execution.LeaseLost, fenceErr)
-		}
-		codeEdgeEffect = &fence.Operation
-		if !fence.Invoke {
-			return runtime.projectCodeEdgeEvaluatorInDoubt(ctx, job, run, stageAttempt, stage, reservation, fence.Operation, nil, "CodeEdge evaluator invocation fence prevents replay")
-		}
-	}
 	var result StageExecutionResult
 	for ordinal := 1; ordinal <= stage.Budget.MaxAttempts; ordinal++ {
 		nodeAttempt, nodeErr := runtime.createRunningNodeAttempt(ctx, stageAttempt, stage, payload.Generation, ordinal, job.CreatedBy)
 		if nodeErr != nil {
-			if codeEdgeEffect != nil {
-				return runtime.projectCodeEdgeEvaluatorInDoubt(ctx, job, run, stageAttempt, stage, reservation, *codeEdgeEffect, nil, nodeErr.Error())
-			}
 			return runtime.failAdmittedStageIntegrity(ctx, job, stageAttempt, reservation, execution.LeaseLost, nodeErr)
 		}
 		attemptContext, attemptCancel := context.WithTimeout(stageContext, stage.Budget.AttemptTimeout)
@@ -1755,21 +1702,11 @@ func (runtime *FrozenExecutionRuntime) handleStageAttempt(ctx context.Context, e
 		if result.Outcome.Status == workflowkit.StatusCompleted && !stage.Verdicts.Allows(result.Outcome.Verdict) {
 			result = StageExecutionResult{Outcome: workflowkit.Outcome{Status: workflowkit.StatusInfraFailed, Failure: workflowkit.FailurePolicy}, ErrorText: fmt.Sprintf("stage emitted frozen-disallowed verdict %q", result.Outcome.Verdict), FailureClass: string(workflowkit.FailurePolicy)}
 		}
-		nodeOutcome := result.Outcome
-		if codeEdgeEffect != nil && codeEdgeEvaluatorOutcomeIsUncertain(result, reservation, execution.LeaseLost, monitor) {
-			nodeOutcome = workflowkit.Outcome{Status: workflowkit.StatusInDoubt}
-		}
-		if err := runtime.transitionNodeAttempt(ctx, nodeAttempt, nodeOutcome, result.ErrorText, job.CreatedBy); err != nil {
-			if codeEdgeEffect != nil {
-				return runtime.projectCodeEdgeEvaluatorInDoubt(ctx, job, run, stageAttempt, stage, reservation, *codeEdgeEffect, nil, err.Error())
-			}
+		if err := runtime.transitionNodeAttempt(ctx, nodeAttempt, result.Outcome, result.ErrorText, job.CreatedBy); err != nil {
 			return runtime.failAdmittedStageIntegrity(ctx, job, stageAttempt, reservation, execution.LeaseLost, err)
 		}
 		retry, retryErr := workflowkit.DecideStageRetry(stage, ordinal, result.Outcome)
 		if retryErr != nil {
-			if codeEdgeEffect != nil {
-				return runtime.projectCodeEdgeEvaluatorInDoubt(ctx, job, run, stageAttempt, stage, reservation, *codeEdgeEffect, nil, retryErr.Error())
-			}
 			return runtime.failAdmittedStageIntegrity(ctx, job, stageAttempt, reservation, execution.LeaseLost, retryErr)
 		}
 		if retry.Retry && stageContext.Err() == nil {
@@ -2562,19 +2499,6 @@ func (runtime *FrozenExecutionRuntime) projectStageTerminal(ctx context.Context,
 	if monitor != nil {
 		operation = monitor.current()
 	}
-	var codeEdgeEffect *store.SideEffectOperation
-	if isCodeEdgeEvaluatorStage(run, stage) {
-		effect, effectErr := runtime.codeEdgeEvaluatorEffectAlreadyStarted(ctx, run, attempt, stage)
-		if effectErr != nil {
-			return store.JobFailed, effectErr
-		}
-		if effect != nil {
-			codeEdgeEffect = effect
-			if effect.State != store.SideEffectStarted || codeEdgeEvaluatorOutcomeIsUncertain(result, reservation, workerLeaseLost, monitor) {
-				return runtime.projectCodeEdgeEvaluatorInDoubt(ctx, job, run, attempt, stage, reservation, *effect, operation, "CodeEdge evaluator terminal projection cannot prove the external outcome")
-			}
-		}
-	}
 	unknownOutcome := reservation.lost() || channelClosed(workerLeaseLost) || result.Outcome.Status == workflowkit.StatusInDoubt || monitor.failureError() != nil
 	if operation != nil && operation.Action == store.ControlActionTerminate && stage.Effect == workflowkit.EffectExternalSideEffect && result.Outcome.Status != workflowkit.StatusCompleted {
 		unknownOutcome = true
@@ -2638,29 +2562,9 @@ func (runtime *FrozenExecutionRuntime) projectStageTerminal(ctx context.Context,
 			manifestID = manifest.ID
 		}
 	}
-	if codeEdgeEffect != nil && codeEdgeEvaluatorOutcomeIsUncertain(result, reservation, workerLeaseLost, monitor) {
-		return runtime.projectCodeEdgeEvaluatorInDoubt(ctx, job, run, attempt, stage, reservation, *codeEdgeEffect, operation, "CodeEdge evaluator evidence persistence cannot prove the external outcome")
-	}
-
 	stageStatus, verdict, failureClass, err := stageProjection(result.Outcome)
 	if err != nil {
 		return store.JobFailed, err
-	}
-	if codeEdgeEffect != nil && stageStatus == store.StageExecutionCompleted {
-		if err := runtime.completeCodeEdgeEvaluatorEffect(ctx, run, attempt, stage, manifest, job.CreatedBy); err != nil {
-			return runtime.projectCodeEdgeEvaluatorInDoubt(ctx, job, run, attempt, stage, reservation, *codeEdgeEffect, operation, "CodeEdge evaluator success fence could not be finalized: "+err.Error())
-		}
-		completedEffect, effectErr := runtime.codeEdgeEvaluatorEffectAlreadyStarted(ctx, run, attempt, stage)
-		if effectErr != nil {
-			return runtime.failRuntimeJob(ctx, job, effectErr)
-		}
-		if completedEffect == nil || completedEffect.State != store.SideEffectSucceeded {
-			return runtime.failRuntimeJob(ctx, job, fmt.Errorf("%w: completed CodeEdge evaluator has no succeeded side effect", ErrFrozenExecutionPayload))
-		}
-		codeEdgeEffect = completedEffect
-		if err := runtime.completeTrustedCodeEdgeEvaluatorTrials(ctx, run, attempt, job.CreatedBy, "project direct completed CodeEdge evaluator trials"); err != nil {
-			return runtime.projectCodeEdgeEvaluatorInDoubt(ctx, job, run, attempt, stage, reservation, *codeEdgeEffect, operation, "CodeEdge evaluator trusted trial projection could not be finalized: "+err.Error())
-		}
 	}
 	settlementOutcome := store.QuotaSettlementCanceled
 	if stageStatus == store.StageExecutionCompleted {

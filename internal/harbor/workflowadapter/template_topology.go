@@ -39,7 +39,6 @@ func catalogPolicyFor(reference TemplateReference) (catalogTemplatePolicy, error
 				workflowkit.StageKey(ContentReview),
 				workflowkit.StageKey(SolutionReview),
 				workflowkit.StageKey(FinalReview),
-				workflowkit.StageKey(ResultReview),
 			},
 		}, nil
 	case reference.Equal(StandardAuthoringContractTemplateReference()):
@@ -54,31 +53,6 @@ func catalogPolicyFor(reference TemplateReference) (catalogTemplatePolicy, error
 			},
 			dependencies:   standardAuthoringDependencies(),
 			validateStages: validateStandardAuthoringV3CatalogStages,
-		}, nil
-	case reference.Equal(CodeEdgePhase1TemplateReference()):
-		return catalogTemplatePolicy{
-			catalogID:                   codeEdgePhase1CatalogID,
-			catalogVersion:              codeEdgePhase1CatalogVersion,
-			stageOrder:                  CodeEdgePhase1StageOrder(),
-			groups:                      codeEdgePhase1StageGroups(),
-			requiresOperatorOnlyPackage: true,
-			gates: []workflowkit.StageKey{
-				workflowkit.StageKey(SolutionReview),
-				workflowkit.StageKey(FinalReview),
-				workflowkit.StageKey(EvaluatorEvidenceHandoff),
-				workflowkit.StageKey(ResultReview),
-			},
-			dependencies: codeEdgePhase1Dependencies(),
-		}, nil
-	case reference.Equal(CodeEdgeEvaluatorChildTemplateReference()):
-		return catalogTemplatePolicy{
-			catalogID:      codeEdgeEvaluatorChildCatalogID,
-			catalogVersion: codeEdgeEvaluatorChildCatalogVersion,
-			stageOrder:     CodeEdgeEvaluatorChildStageOrder(),
-			groups:         codeEdgeEvaluatorChildStageGroups(),
-			gates:          []workflowkit.StageKey{},
-			dependencies:   codeEdgeEvaluatorChildDependencies(),
-			validateStages: validateCodeEdgeEvaluatorChildCatalogStages,
 		}, nil
 	default:
 		return catalogTemplatePolicy{}, fmt.Errorf("%w: workflow template %s@%s has no catalog policy", errInvalidCatalog, reference.ID, reference.Version)
@@ -151,27 +125,6 @@ func validateStandardAuthoringV3CatalogStages(stages map[workflowkit.StageKey]St
 		definition = definition.Clone()
 		if !present || !reflect.DeepEqual(actual, definition) {
 			return fmt.Errorf("%w: Standard authoring 3.0 stage %q does not match frozen descriptor", errInvalidCatalog, definition.Key)
-		}
-	}
-	return nil
-}
-
-// validateCodeEdgeEvaluatorChildCatalogStages freezes more than the DAG for
-// the evaluator child. It has only two externally billable operations, so an
-// altered screenshot schema, extra artifact, relaxed effect, or generic retry
-// would silently change the evidence contract even if the two stage keys and
-// their dependency still looked valid.
-func validateCodeEdgeEvaluatorChildCatalogStages(stages map[workflowkit.StageKey]StageDefinition) error {
-	expected := codeEdgeEvaluatorChildStageDefinitions()
-	if len(stages) != len(expected) {
-		return fmt.Errorf("%w: CodeEdge evaluator child stage count %d does not match frozen descriptor", errInvalidCatalog, len(stages))
-	}
-	for _, definition := range expected {
-		actual, present := stages[definition.Key]
-		actual = actual.Clone()
-		definition = definition.Clone()
-		if !present || !reflect.DeepEqual(actual, definition) {
-			return fmt.Errorf("%w: CodeEdge evaluator child stage %q does not match frozen descriptor", errInvalidCatalog, definition.Key)
 		}
 	}
 	return nil

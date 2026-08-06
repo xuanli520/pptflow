@@ -11,7 +11,7 @@ import (
 )
 
 func TestUninjectedProductionBindingFailsLifecycleCLIBeforeOpeningStore(t *testing.T) {
-	clearCodeEdgeProductionBuildBindingForTest(t)
+	clearStandardAuthoringProductionBuildBindingForTest(t)
 	managedRoot := filepath.Join(t.TempDir(), "managed-control-plane")
 	command := NewRootCommand()
 	command.SetOut(io.Discard)
@@ -26,7 +26,7 @@ func TestUninjectedProductionBindingFailsLifecycleCLIBeforeOpeningStore(t *testi
 }
 
 func TestUninjectedProductionBindingFailsLifecycleTUIBeforeOpeningStore(t *testing.T) {
-	clearCodeEdgeProductionBuildBindingForTest(t)
+	clearStandardAuthoringProductionBuildBindingForTest(t)
 	managedRoot := filepath.Join(t.TempDir(), "managed-control-plane")
 	command := NewRootCommand()
 	command.SetOut(io.Discard)
@@ -40,33 +40,33 @@ func TestUninjectedProductionBindingFailsLifecycleTUIBeforeOpeningStore(t *testi
 	assertNoPreflightManagedRoot(t, managedRoot)
 }
 
-func clearCodeEdgeProductionBuildBindingForTest(t *testing.T) {
+func clearStandardAuthoringProductionBuildBindingForTest(t *testing.T) {
 	t.Helper()
-	originalModule := codeEdgeProductionBuildModule
-	originalVersion := codeEdgeProductionBuildVersion
-	originalCommit := codeEdgeProductionBuildCommit
-	originalContent := codeEdgeProductionBuildContentSHA256
-	originalCatalogReceipt := codeEdgeProductionBuildCatalogReceiptFingerprint
-	originalLockID := codeEdgeProductionBuildLockID
-	originalLockVersion := codeEdgeProductionBuildLockVersion
-	originalLockFingerprint := codeEdgeProductionBuildLockFingerprint
-	codeEdgeProductionBuildModule = ""
-	codeEdgeProductionBuildVersion = ""
-	codeEdgeProductionBuildCommit = ""
-	codeEdgeProductionBuildContentSHA256 = ""
-	codeEdgeProductionBuildCatalogReceiptFingerprint = ""
-	codeEdgeProductionBuildLockID = ""
-	codeEdgeProductionBuildLockVersion = ""
-	codeEdgeProductionBuildLockFingerprint = ""
+	originalModule := standardAuthoringProductionBuildModule
+	originalVersion := standardAuthoringProductionBuildVersion
+	originalCommit := standardAuthoringProductionBuildCommit
+	originalContent := standardAuthoringProductionBuildContentSHA256
+	originalCatalogReceipt := standardAuthoringProductionBuildCatalogReceiptFingerprint
+	originalLockID := standardAuthoringProductionBuildLockID
+	originalLockVersion := standardAuthoringProductionBuildLockVersion
+	originalLockFingerprint := standardAuthoringProductionBuildLockFingerprint
+	standardAuthoringProductionBuildModule = ""
+	standardAuthoringProductionBuildVersion = ""
+	standardAuthoringProductionBuildCommit = ""
+	standardAuthoringProductionBuildContentSHA256 = ""
+	standardAuthoringProductionBuildCatalogReceiptFingerprint = ""
+	standardAuthoringProductionBuildLockID = ""
+	standardAuthoringProductionBuildLockVersion = ""
+	standardAuthoringProductionBuildLockFingerprint = ""
 	t.Cleanup(func() {
-		codeEdgeProductionBuildModule = originalModule
-		codeEdgeProductionBuildVersion = originalVersion
-		codeEdgeProductionBuildCommit = originalCommit
-		codeEdgeProductionBuildContentSHA256 = originalContent
-		codeEdgeProductionBuildCatalogReceiptFingerprint = originalCatalogReceipt
-		codeEdgeProductionBuildLockID = originalLockID
-		codeEdgeProductionBuildLockVersion = originalLockVersion
-		codeEdgeProductionBuildLockFingerprint = originalLockFingerprint
+		standardAuthoringProductionBuildModule = originalModule
+		standardAuthoringProductionBuildVersion = originalVersion
+		standardAuthoringProductionBuildCommit = originalCommit
+		standardAuthoringProductionBuildContentSHA256 = originalContent
+		standardAuthoringProductionBuildCatalogReceiptFingerprint = originalCatalogReceipt
+		standardAuthoringProductionBuildLockID = originalLockID
+		standardAuthoringProductionBuildLockVersion = originalLockVersion
+		standardAuthoringProductionBuildLockFingerprint = originalLockFingerprint
 	})
 }
 

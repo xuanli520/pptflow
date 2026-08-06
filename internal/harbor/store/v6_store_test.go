@@ -62,7 +62,7 @@ func TestConsolidatedV2RegistersEveryTextPrimaryKeyEntity(t *testing.T) {
 	}
 	for _, table := range []string{
 		"tasks_v2", "workflow_runs", "lifecycle_operations_v12",
-		"trial_executions_v19", "trial_attempts_v19", "codeedge_compliance_records_v20",
+		"trial_executions_v19", "trial_attempts_v19",
 	} {
 		if _, ok := identityTables[table]; !ok {
 			t.Fatalf("missing V2 global identity source table %q", table)

@@ -956,7 +956,7 @@ func hasCommandPurgeBlocker(blockers []app.PurgeTaskBlocker, code, id string) bo
 	return false
 }
 
-func TestLifecycleMutationCheckpointReplayRestoresCodeEdgePackageAuthorization(t *testing.T) {
+func TestLifecycleMutationCheckpointReplayRestoresPackageIdentity(t *testing.T) {
 	ctx := context.Background()
 	services := openCommandLifecycle(t, t.TempDir())
 	defer services.Store().Close()
@@ -965,16 +965,13 @@ func TestLifecycleMutationCheckpointReplayRestoresCodeEdgePackageAuthorization(t
 	expectedTaskID := commandLifecycleUUID(t)
 	expectedRevisionID := commandLifecycleUUID(t)
 	expectedRunID := commandLifecycleUUID(t)
-	expectedComplianceID := commandLifecycleUUID(t)
-	expectedAuthorization := string(workflowkit.SHA256Fingerprint([]byte("command-codeedge-authorization")))
 	if _, err := services.Store().BeginLifecycleOperation(ctx, store.BeginLifecycleOperationRequest{
 		IdempotencyKey: key, Action: string(app.LifecycleMutationPackage), RequestFingerprint: "sha256:command-codeedge-checkpoint",
 		TaskID: expectedTaskID, RevisionID: expectedRevisionID, RunID: expectedRunID, ReleaseID: key,
 		ExpectedTaskID: expectedTaskID, ExpectedRevisionID: expectedRevisionID, ExpectedRunID: expectedRunID,
 		ExpectedTaskVersion: 1, ExpectedRevisionStateVersion: 1, ExpectedRevisionDigest: "harbor.task.v2:sha256:" + strings.Repeat("a", 64),
 		ExpectedRunVersion: 1, ExpectedRunDefinitionHash: "sha256:" + strings.Repeat("b", 64),
-		ExpectedCodeEdgeComplianceRecordID: expectedComplianceID, ExpectedCodeEdgeAuthorizationFingerprint: expectedAuthorization,
-		Actor: "tester", Reason: "persist CodeEdge package checkpoint",
+		Actor: "tester", Reason: "persist package checkpoint",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -982,8 +979,8 @@ func TestLifecycleMutationCheckpointReplayRestoresCodeEdgePackageAuthorization(t
 	if err != nil || !found {
 		t.Fatalf("restore package checkpoint = %+v found=%t err=%v", checkpoint, found, err)
 	}
-	if checkpoint.RunID != expectedRunID || checkpoint.CodeEdgeComplianceRecordID != expectedComplianceID || checkpoint.CodeEdgeAuthorizationFingerprint != expectedAuthorization {
-		t.Fatalf("replayed CodeEdge package checkpoint = %+v", checkpoint)
+	if checkpoint.RunID != expectedRunID || checkpoint.TaskID != expectedTaskID || checkpoint.RevisionID != expectedRevisionID {
+		t.Fatalf("replayed package checkpoint = %+v", checkpoint)
 	}
 }
 

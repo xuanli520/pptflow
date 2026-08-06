@@ -1,7 +1,7 @@
-// Command harbor-flow-production-build verifies the three independently
-// attested production deployment bundles and emits linker bindings for one
-// Harbor Flow binary. It reads no environment values and accepts only
-// catalog/lock paths plus the frozen source-manifest digest.
+// Command harbor-flow-production-build verifies the Standard authoring
+// production deployment bundle and emits linker bindings for one Harbor Flow
+// binary. It reads no environment values and accepts only catalog/lock paths
+// plus the frozen source-manifest digest.
 package main
 
 import (
@@ -25,45 +25,21 @@ const (
 	standardAuthoringBuildLockIDVariable                    = "github.com/purplevoid/harbor-factory/cmd.standardAuthoringProductionBuildLockID"
 	standardAuthoringBuildLockVersionVariable               = "github.com/purplevoid/harbor-factory/cmd.standardAuthoringProductionBuildLockVersion"
 	standardAuthoringBuildLockFingerprintVariable           = "github.com/purplevoid/harbor-factory/cmd.standardAuthoringProductionBuildLockFingerprint"
-
-	codeEdgePhase1BuildModuleVariable                    = "github.com/purplevoid/harbor-factory/cmd.codeEdgePhase1ProductionBuildModule"
-	codeEdgePhase1BuildVersionVariable                   = "github.com/purplevoid/harbor-factory/cmd.codeEdgePhase1ProductionBuildVersion"
-	codeEdgePhase1BuildCommitVariable                    = "github.com/purplevoid/harbor-factory/cmd.codeEdgePhase1ProductionBuildCommit"
-	codeEdgePhase1BuildDigestVariable                    = "github.com/purplevoid/harbor-factory/cmd.codeEdgePhase1ProductionBuildContentSHA256"
-	codeEdgePhase1BuildCatalogReceiptFingerprintVariable = "github.com/purplevoid/harbor-factory/cmd.codeEdgePhase1ProductionBuildCatalogReceiptFingerprint"
-	codeEdgePhase1BuildLockIDVariable                    = "github.com/purplevoid/harbor-factory/cmd.codeEdgePhase1ProductionBuildLockID"
-	codeEdgePhase1BuildLockVersionVariable               = "github.com/purplevoid/harbor-factory/cmd.codeEdgePhase1ProductionBuildLockVersion"
-	codeEdgePhase1BuildLockFingerprintVariable           = "github.com/purplevoid/harbor-factory/cmd.codeEdgePhase1ProductionBuildLockFingerprint"
-
-	codeEdgeEvaluatorBuildModuleVariable                    = "github.com/purplevoid/harbor-factory/cmd.codeEdgeProductionBuildModule"
-	codeEdgeEvaluatorBuildVersionVariable                   = "github.com/purplevoid/harbor-factory/cmd.codeEdgeProductionBuildVersion"
-	codeEdgeEvaluatorBuildCommitVariable                    = "github.com/purplevoid/harbor-factory/cmd.codeEdgeProductionBuildCommit"
-	codeEdgeEvaluatorBuildDigestVariable                    = "github.com/purplevoid/harbor-factory/cmd.codeEdgeProductionBuildContentSHA256"
-	codeEdgeEvaluatorBuildCatalogReceiptFingerprintVariable = "github.com/purplevoid/harbor-factory/cmd.codeEdgeProductionBuildCatalogReceiptFingerprint"
-	codeEdgeEvaluatorBuildLockIDVariable                    = "github.com/purplevoid/harbor-factory/cmd.codeEdgeProductionBuildLockID"
-	codeEdgeEvaluatorBuildLockVersionVariable               = "github.com/purplevoid/harbor-factory/cmd.codeEdgeProductionBuildLockVersion"
-	codeEdgeEvaluatorBuildLockFingerprintVariable           = "github.com/purplevoid/harbor-factory/cmd.codeEdgeProductionBuildLockFingerprint"
 )
 
 type productionBuildConfig struct {
 	StandardAuthoringCatalog string
 	StandardAuthoringLock    string
-	CodeEdgePhase1Catalog    string
-	CodeEdgePhase1Lock       string
-	CodeEdgeEvaluatorCatalog string
-	CodeEdgeEvaluatorLock    string
 	SourceManifest           string
 }
 
 type bundleInput struct {
-	name              string
-	catalogLabel      string
-	lockLabel         string
-	catalogPath       string
-	lockPath          string
-	expectedTemplate  workflowadapter.TemplateReference
-	standardAuthoring bool
-	variables         buildVariables
+	name         string
+	catalogLabel string
+	lockLabel    string
+	catalogPath  string
+	lockPath     string
+	variables    buildVariables
 }
 
 type buildVariables struct {
@@ -92,10 +68,6 @@ func main() {
 	var config productionBuildConfig
 	flag.StringVar(&config.StandardAuthoringCatalog, "standard-authoring-catalog", "", "Standard authoring deployment catalog")
 	flag.StringVar(&config.StandardAuthoringLock, "standard-authoring-lock", "", "Standard authoring deployment lock")
-	flag.StringVar(&config.CodeEdgePhase1Catalog, "codeedge-phase1-catalog", "", "CodeEdge Phase-1 parent deployment catalog")
-	flag.StringVar(&config.CodeEdgePhase1Lock, "codeedge-phase1-lock", "", "CodeEdge Phase-1 parent deployment lock")
-	flag.StringVar(&config.CodeEdgeEvaluatorCatalog, "codeedge-evaluator-catalog", "", "CodeEdge evaluator child deployment catalog")
-	flag.StringVar(&config.CodeEdgeEvaluatorLock, "codeedge-evaluator-lock", "", "CodeEdge evaluator child deployment lock")
 	flag.StringVar(&config.SourceManifest, "source-manifest", "", "SHA-256 digest of the frozen source manifest")
 	flag.Parse()
 	if flag.NArg() != 0 {
@@ -118,37 +90,12 @@ func productionBuildLDFlags(config productionBuildConfig) (string, error) {
 		{
 			name: "Standard authoring", catalogLabel: "standard authoring catalog", lockLabel: "standard authoring lock",
 			catalogPath: config.StandardAuthoringCatalog, lockPath: config.StandardAuthoringLock,
-			standardAuthoring: true,
 			variables: buildVariables{
 				module: standardAuthoringBuildModuleVariable, version: standardAuthoringBuildVersionVariable,
 				commit: standardAuthoringBuildCommitVariable, digest: standardAuthoringBuildDigestVariable,
 				catalogReceiptFingerprint: standardAuthoringBuildCatalogReceiptFingerprintVariable,
 				lockID:                    standardAuthoringBuildLockIDVariable, lockVersion: standardAuthoringBuildLockVersionVariable,
 				lockFingerprint: standardAuthoringBuildLockFingerprintVariable,
-			},
-		},
-		{
-			name: "CodeEdge Phase-1", catalogLabel: "CodeEdge Phase-1 catalog", lockLabel: "CodeEdge Phase-1 lock",
-			catalogPath: config.CodeEdgePhase1Catalog, lockPath: config.CodeEdgePhase1Lock,
-			expectedTemplate: workflowadapter.CodeEdgePhase1TemplateReference(),
-			variables: buildVariables{
-				module: codeEdgePhase1BuildModuleVariable, version: codeEdgePhase1BuildVersionVariable,
-				commit: codeEdgePhase1BuildCommitVariable, digest: codeEdgePhase1BuildDigestVariable,
-				catalogReceiptFingerprint: codeEdgePhase1BuildCatalogReceiptFingerprintVariable,
-				lockID:                    codeEdgePhase1BuildLockIDVariable, lockVersion: codeEdgePhase1BuildLockVersionVariable,
-				lockFingerprint: codeEdgePhase1BuildLockFingerprintVariable,
-			},
-		},
-		{
-			name: "CodeEdge evaluator child", catalogLabel: "CodeEdge evaluator child catalog", lockLabel: "CodeEdge evaluator child lock",
-			catalogPath: config.CodeEdgeEvaluatorCatalog, lockPath: config.CodeEdgeEvaluatorLock,
-			expectedTemplate: workflowadapter.CodeEdgeEvaluatorChildTemplateReference(),
-			variables: buildVariables{
-				module: codeEdgeEvaluatorBuildModuleVariable, version: codeEdgeEvaluatorBuildVersionVariable,
-				commit: codeEdgeEvaluatorBuildCommitVariable, digest: codeEdgeEvaluatorBuildDigestVariable,
-				catalogReceiptFingerprint: codeEdgeEvaluatorBuildCatalogReceiptFingerprintVariable,
-				lockID:                    codeEdgeEvaluatorBuildLockIDVariable, lockVersion: codeEdgeEvaluatorBuildLockVersionVariable,
-				lockFingerprint: codeEdgeEvaluatorBuildLockFingerprintVariable,
 			},
 		},
 	}
@@ -193,10 +140,6 @@ func normalizeProductionBuildConfig(config productionBuildConfig) (productionBui
 	}{
 		{label: "standard authoring catalog", value: &config.StandardAuthoringCatalog},
 		{label: "standard authoring lock", value: &config.StandardAuthoringLock},
-		{label: "CodeEdge Phase-1 catalog", value: &config.CodeEdgePhase1Catalog},
-		{label: "CodeEdge Phase-1 lock", value: &config.CodeEdgePhase1Lock},
-		{label: "CodeEdge evaluator child catalog", value: &config.CodeEdgeEvaluatorCatalog},
-		{label: "CodeEdge evaluator child lock", value: &config.CodeEdgeEvaluatorLock},
 	}
 	resolved := make([]resolvedInputFile, 0, len(inputs))
 	for _, input := range inputs {
@@ -250,12 +193,8 @@ func verifyBundle(input bundleInput) (verifiedBundle, error) {
 	if err != nil {
 		return verifiedBundle{}, fmt.Errorf("resolve %s: %w", input.catalogLabel, err)
 	}
-	if (input.standardAuthoring && !workflowadapter.IsStandardAuthoringWorkflowTemplate(catalog.Template())) ||
-		(!input.standardAuthoring && !catalog.Template().Equal(input.expectedTemplate)) {
-		if input.standardAuthoring {
-			return verifiedBundle{}, fmt.Errorf("%s template is %s@%s; want an installed Standard authoring template", input.catalogLabel, catalog.Template().ID, catalog.Template().Version)
-		}
-		return verifiedBundle{}, fmt.Errorf("%s template is %s@%s; want %s@%s", input.catalogLabel, catalog.Template().ID, catalog.Template().Version, input.expectedTemplate.ID, input.expectedTemplate.Version)
+	if !workflowadapter.IsStandardAuthoringWorkflowTemplate(catalog.Template()) {
+		return verifiedBundle{}, fmt.Errorf("%s template is %s@%s; want an installed Standard authoring template", input.catalogLabel, catalog.Template().ID, catalog.Template().Version)
 	}
 
 	lockRaw, err := os.ReadFile(input.lockPath)
@@ -266,12 +205,8 @@ func verifyBundle(input bundleInput) (verifiedBundle, error) {
 	if err != nil {
 		return verifiedBundle{}, fmt.Errorf("parse %s: %w", input.lockLabel, err)
 	}
-	if (input.standardAuthoring && !workflowadapter.IsStandardAuthoringWorkflowTemplate(lock.CatalogReceipt.Template)) ||
-		(!input.standardAuthoring && !lock.CatalogReceipt.Template.Equal(input.expectedTemplate)) {
-		if input.standardAuthoring {
-			return verifiedBundle{}, fmt.Errorf("%s template is %s@%s; want an installed Standard authoring template", input.lockLabel, lock.CatalogReceipt.Template.ID, lock.CatalogReceipt.Template.Version)
-		}
-		return verifiedBundle{}, fmt.Errorf("%s template is %s@%s; want %s@%s", input.lockLabel, lock.CatalogReceipt.Template.ID, lock.CatalogReceipt.Template.Version, input.expectedTemplate.ID, input.expectedTemplate.Version)
+	if !workflowadapter.IsStandardAuthoringWorkflowTemplate(lock.CatalogReceipt.Template) {
+		return verifiedBundle{}, fmt.Errorf("%s template is %s@%s; want an installed Standard authoring template", input.lockLabel, lock.CatalogReceipt.Template.ID, lock.CatalogReceipt.Template.Version)
 	}
 	verifier, err := stageprovider.NewDeploymentOperationCatalogLockResolver(catalog, lock)
 	if err != nil {
@@ -300,21 +235,12 @@ func verifyDistinctBundleIdentities(bundles []verifiedBundle) error {
 }
 
 func verifySharedBuildIdentity(bundles []verifiedBundle, sourceManifest workflowkit.Fingerprint) error {
-	if len(bundles) != 3 {
-		return fmt.Errorf("exactly three deployment bundles are required")
+	if len(bundles) != 1 {
+		return fmt.Errorf("exactly one deployment bundle is required")
 	}
-	baseline := bundles[0].verifier.HarborFlowBuild()
-	if baseline.ContentSHA256 != sourceManifest {
+	build := bundles[0].verifier.HarborFlowBuild()
+	if build.ContentSHA256 != sourceManifest {
 		return fmt.Errorf("%s lock source manifest does not match frozen source", bundles[0].input.name)
-	}
-	for _, bundle := range bundles[1:] {
-		build := bundle.verifier.HarborFlowBuild()
-		if build != baseline {
-			return fmt.Errorf("%s build identity does not match %s build identity", bundle.input.name, bundles[0].input.name)
-		}
-		if build.ContentSHA256 != sourceManifest {
-			return fmt.Errorf("%s lock source manifest does not match frozen source", bundle.input.name)
-		}
 	}
 	return nil
 }

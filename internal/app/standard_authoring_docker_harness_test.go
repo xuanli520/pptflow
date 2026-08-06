@@ -106,32 +106,32 @@ type standardAuthoringHarnessRunner struct {
 	t                *testing.T
 	imageID          string
 	sourceAccessExit int
-	commands         []CodeEdgePhase1Command
+	commands         []lockedDockerCommand
 }
 
-func (runner *standardAuthoringHarnessRunner) Run(_ context.Context, command CodeEdgePhase1Command) (CodeEdgePhase1CommandResult, error) {
+func (runner *standardAuthoringHarnessRunner) Run(_ context.Context, command lockedDockerCommand) (lockedDockerCommandResult, error) {
 	runner.t.Helper()
 	copy := command
 	copy.Args = append([]string(nil), command.Args...)
 	copy.Env = append([]string(nil), command.Env...)
 	runner.commands = append(runner.commands, copy)
 	if len(command.Args) == 0 {
-		return CodeEdgePhase1CommandResult{}, nil
+		return lockedDockerCommandResult{}, nil
 	}
 	switch command.Args[0] {
 	case "build":
-		return CodeEdgePhase1CommandResult{Stdout: []byte("build completed\n")}, nil
+		return lockedDockerCommandResult{Stdout: []byte("build completed\n")}, nil
 	case "image":
-		return CodeEdgePhase1CommandResult{Stdout: []byte(runner.imageID + "\n")}, nil
+		return lockedDockerCommandResult{Stdout: []byte(runner.imageID + "\n")}, nil
 	case "run":
 		taskRoot := standardAuthoringHarnessMountSource(command.Args, "/task")
 		workRoot := standardAuthoringHarnessMountSource(command.Args, "/work")
 		program := command.Args[len(command.Args)-1]
 		if program == standardAuthoringDockerHarnessSourceAccessProgram {
 			if runner.sourceAccessExit != 0 {
-				return CodeEdgePhase1CommandResult{ExitCode: runner.sourceAccessExit, Stderr: []byte("source is inaccessible\n")}, nil
+				return lockedDockerCommandResult{ExitCode: runner.sourceAccessExit, Stderr: []byte("source is inaccessible\n")}, nil
 			}
-			return CodeEdgePhase1CommandResult{Stdout: []byte("source copied\n")}, nil
+			return lockedDockerCommandResult{Stdout: []byte("source copied\n")}, nil
 		}
 		if strings.Contains(program, "/work") && workRoot != "" {
 			if err := os.MkdirAll(workRoot, 0o755); err != nil {
@@ -140,20 +140,20 @@ func (runner *standardAuthoringHarnessRunner) Run(_ context.Context, command Cod
 		}
 		if strings.Contains(program, "tests/test.sh") {
 			if strings.Contains(program, "solution/solve.sh") {
-				return CodeEdgePhase1CommandResult{Stdout: []byte(command.Dir + " sk-abcdefghijklmnop\n")}, nil
+				return lockedDockerCommandResult{Stdout: []byte(command.Dir + " sk-abcdefghijklmnop\n")}, nil
 			}
 			testBytes, err := os.ReadFile(filepath.Join(taskRoot, "tests", "test.sh"))
 			if err != nil {
 				runner.t.Fatal(err)
 			}
 			if strings.Contains(string(testBytes), "INITIAL_PASS") {
-				return CodeEdgePhase1CommandResult{}, nil
+				return lockedDockerCommandResult{}, nil
 			}
-			return CodeEdgePhase1CommandResult{ExitCode: 1, Stderr: []byte("expected initial failure\n")}, nil
+			return lockedDockerCommandResult{ExitCode: 1, Stderr: []byte("expected initial failure\n")}, nil
 		}
-		return CodeEdgePhase1CommandResult{Stdout: []byte(command.Dir + " sk-abcdefghijklmnop\n")}, nil
+		return lockedDockerCommandResult{Stdout: []byte(command.Dir + " sk-abcdefghijklmnop\n")}, nil
 	default:
-		return CodeEdgePhase1CommandResult{}, nil
+		return lockedDockerCommandResult{}, nil
 	}
 }
 
@@ -171,14 +171,14 @@ func standardAuthoringHarnessMountSource(args []string, destination string) stri
 	return ""
 }
 
-func newStandardAuthoringDockerHarnessForTest(t *testing.T, root string, runner CodeEdgePhase1CommandRunner) *StandardAuthoringDockerHarness {
+func newStandardAuthoringDockerHarnessForTest(t *testing.T, root string, runner lockedDockerCommandRunner) *StandardAuthoringDockerHarness {
 	t.Helper()
 	harness, err := NewStandardAuthoringDockerHarness(StandardAuthoringDockerHarnessConfig{
 		ManagedRoot: root,
 		LockedCommands: []stageprovider.LocalExecutableLock{
-			{CommandID: stageprovider.CodeEdgePhase1DockerBuildCommandID, AbsolutePath: "/opt/locked/docker-build", Version: "29.5.2", ContentSHA256: workflowkit.SHA256Fingerprint([]byte("docker-build"))},
-			{CommandID: stageprovider.CodeEdgePhase1InitialVerifyCommandID, AbsolutePath: "/opt/locked/docker-initial", Version: "29.5.2", ContentSHA256: workflowkit.SHA256Fingerprint([]byte("docker-initial"))},
-			{CommandID: stageprovider.CodeEdgePhase1OracleVerifyCommandID, AbsolutePath: "/opt/locked/docker-oracle", Version: "29.5.2", ContentSHA256: workflowkit.SHA256Fingerprint([]byte("docker-oracle"))},
+			{CommandID: stageprovider.StandardAuthoringDockerBuildCommandID, AbsolutePath: "/opt/locked/docker-build", Version: "29.5.2", ContentSHA256: workflowkit.SHA256Fingerprint([]byte("docker-build"))},
+			{CommandID: stageprovider.StandardAuthoringInitialVerifyCommandID, AbsolutePath: "/opt/locked/docker-initial", Version: "29.5.2", ContentSHA256: workflowkit.SHA256Fingerprint([]byte("docker-initial"))},
+			{CommandID: stageprovider.StandardAuthoringOracleVerifyCommandID, AbsolutePath: "/opt/locked/docker-oracle", Version: "29.5.2", ContentSHA256: workflowkit.SHA256Fingerprint([]byte("docker-oracle"))},
 		},
 		Runner: runner, CommandTimeout: time.Minute,
 		ExecutableAttestor: func(context.Context, stageprovider.LocalExecutableLock) error { return nil },

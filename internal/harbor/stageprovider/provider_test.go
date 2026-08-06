@@ -182,64 +182,69 @@ func TestPublicWorkflowkitAdapterReadsFrozenOpaqueExecutionSpec(t *testing.T) {
 	}
 }
 
-func TestPublicWorkflowkitAdapterRequiresExactTemplateAndSupportsCodeEdge(t *testing.T) {
+func TestPublicWorkflowkitAdapterRequiresExactFrozenTemplate(t *testing.T) {
 	if _, err := NewWorkflowkitStageExecutorRegistry(); err == nil {
 		t.Fatal("template-less public-engine registry unexpectedly succeeded")
 	}
-	registry, err := NewWorkflowkitStageExecutorRegistry(WorkflowkitRegistryOptions{Template: workflowadapter.CodeEdgePhase1TemplateReference()})
-	if err != nil {
-		t.Fatalf("construct CodeEdge public-engine registry: %v", err)
-	}
-	definition, found := workflowadapter.CodeEdgePhase1StageCatalog().Stage(workflowadapter.CodeEdgeLint)
+	specification := testsupport.CompleteRunExecutionSpec(stageProviderTestTaskID, stageProviderTestRevisionID, stageProviderTestDigest)
+	definition, found := workflowadapter.StandardStageCatalog().Stage(workflowadapter.RepoPrepare)
 	if !found {
-		t.Fatal("CodeEdge lint stage is missing")
+		t.Fatal("repo prepare stage is missing")
+	}
+
+	registry, err := NewWorkflowkitStageExecutorRegistry(WorkflowkitRegistryOptions{Template: workflowadapter.StandardTemplateReference()})
+	if err != nil {
+		t.Fatalf("construct Standard public-engine registry: %v", err)
 	}
 	executor, err := registry.ResolvePlugin(catalogPluginBinding(definition.Plugin))
 	if err != nil {
 		t.Fatal(err)
 	}
-	codeEdgeSpec := testsupport.CompleteCodeEdgePhase1RunExecutionSpec(stageProviderTestTaskID, stageProviderTestRevisionID, stageProviderTestDigest)
-	if _, err := executor.ExecuteStage(context.Background(), workflowkitStageRequest(t, codeEdgeSpec, definition)); !errors.Is(err, ErrProviderUnavailable) {
-		t.Fatalf("CodeEdge registry did not consume its exact frozen template: %v", err)
+	if _, err := executor.ExecuteStage(context.Background(), workflowkitStageRequest(t, specification, definition)); !errors.Is(err, ErrProviderUnavailable) {
+		t.Fatalf("Standard registry did not consume its exact frozen template: %v", err)
 	}
-	standardSpec := testsupport.CompleteRunExecutionSpec(stageProviderTestTaskID, stageProviderTestRevisionID, stageProviderTestDigest)
-	if _, err := executor.ExecuteStage(context.Background(), workflowkitStageRequest(t, standardSpec, definition)); !errors.Is(err, ErrFrozenExecutionSpec) {
-		t.Fatalf("Standard spec reached CodeEdge registry instead of template rejection: %v", err)
+
+	authoringRegistry, err := NewWorkflowkitStageExecutorRegistry(WorkflowkitRegistryOptions{Template: workflowadapter.StandardAuthoringCurrentTemplateReference()})
+	if err != nil {
+		t.Fatalf("construct Standard authoring public-engine registry: %v", err)
+	}
+	authoringExecutor, err := authoringRegistry.ResolvePlugin(catalogPluginBinding(definition.Plugin))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := authoringExecutor.ExecuteStage(context.Background(), workflowkitStageRequest(t, specification, definition)); !errors.Is(err, ErrFrozenExecutionSpec) {
+		t.Fatalf("Standard spec reached authoring registry instead of template rejection: %v", err)
 	}
 }
 
 func TestPublicWorkflowkitAdapterDispatchesAnExplicitMultiTemplateSetByFrozenSpec(t *testing.T) {
 	registry, err := NewWorkflowkitStageExecutorRegistry(WorkflowkitRegistryOptions{Templates: []workflowadapter.TemplateReference{
-		workflowadapter.StandardTemplateReference(), workflowadapter.CodeEdgePhase1TemplateReference(),
+		workflowadapter.StandardTemplateReference(), workflowadapter.StandardAuthoringCurrentTemplateReference(),
 	}})
 	if err != nil {
 		t.Fatalf("construct explicit multi-template registry: %v", err)
 	}
-	codeEdgeDefinition, found := workflowadapter.CodeEdgePhase1StageCatalog().Stage(workflowadapter.CodeEdgeLint)
+	standardDefinition, found := workflowadapter.StandardStageCatalog().Stage(workflowadapter.RepoPrepare)
 	if !found {
-		t.Fatal("CodeEdge lint stage is missing")
+		t.Fatal("Standard repo prepare stage is missing")
 	}
-	standardDefinition, found := workflowadapter.StandardStageCatalog().Stage(workflowadapter.CodeEdgeLint)
+	authoringDefinition, found := workflowadapter.StandardAuthoringCurrentWorkflowTemplate().Catalog.Stage(workflowadapter.RepoPrepare)
 	if !found {
-		t.Fatal("Standard lint stage is missing")
+		t.Fatal("Standard authoring repo prepare stage is missing")
 	}
-	if codeEdgeDefinition.Plugin != standardDefinition.Plugin {
-		t.Fatalf("fixture needs one shared plugin binding, CodeEdge=%+v Standard=%+v", codeEdgeDefinition.Plugin, standardDefinition.Plugin)
+	if standardDefinition.Plugin != authoringDefinition.Plugin {
+		t.Fatalf("fixture needs one shared plugin binding, Standard=%+v authoring=%+v", standardDefinition.Plugin, authoringDefinition.Plugin)
 	}
-	executor, err := registry.ResolvePlugin(catalogPluginBinding(codeEdgeDefinition.Plugin))
+	executor, err := registry.ResolvePlugin(catalogPluginBinding(standardDefinition.Plugin))
 	if err != nil {
 		t.Fatal(err)
-	}
-	codeEdgeSpec := testsupport.CompleteCodeEdgePhase1RunExecutionSpec(stageProviderTestTaskID, stageProviderTestRevisionID, stageProviderTestDigest)
-	if _, err := executor.ExecuteStage(context.Background(), workflowkitStageRequest(t, codeEdgeSpec, codeEdgeDefinition)); !errors.Is(err, ErrProviderUnavailable) {
-		t.Fatalf("CodeEdge spec did not reach its explicit template executor: %v", err)
 	}
 	standardSpec := testsupport.CompleteRunExecutionSpec(stageProviderTestTaskID, stageProviderTestRevisionID, stageProviderTestDigest)
 	if _, err := executor.ExecuteStage(context.Background(), workflowkitStageRequest(t, standardSpec, standardDefinition)); !errors.Is(err, ErrProviderUnavailable) {
 		t.Fatalf("Standard spec did not reach its explicit template executor: %v", err)
 	}
 	if _, err := NewWorkflowkitStageExecutorRegistry(WorkflowkitRegistryOptions{
-		Template: workflowadapter.StandardTemplateReference(), Templates: []workflowadapter.TemplateReference{workflowadapter.CodeEdgePhase1TemplateReference()},
+		Template: workflowadapter.StandardTemplateReference(), Templates: []workflowadapter.TemplateReference{workflowadapter.StandardAuthoringCurrentTemplateReference()},
 	}); err == nil {
 		t.Fatal("registry accepted ambiguous single and multi template configuration")
 	}

@@ -4,8 +4,6 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
-
-	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
 func TestClosedTemplateRegistryResolvesExactVersionsWithoutFallback(t *testing.T) {
@@ -13,8 +11,6 @@ func TestClosedTemplateRegistryResolvesExactVersionsWithoutFallback(t *testing.T
 	for _, reference := range []TemplateReference{
 		StandardTemplateReference(),
 		StandardAuthoringCurrentTemplateReference(),
-		CodeEdgePhase1TemplateReference(),
-		CodeEdgeEvaluatorChildTemplateReference(),
 	} {
 		template, err := registry.ResolveTemplate(reference)
 		if err != nil {
@@ -75,15 +71,15 @@ func TestStandardAuthoringV2RegistryRejectsAllLegacyVersions(t *testing.T) {
 
 func TestExplicitTemplateBindingRejectsCrossTemplateAndTemplateLessDocuments(t *testing.T) {
 	standardTemplate := StandardWorkflowTemplate()
-	codeEdgeTemplate := CodeEdgePhase1WorkflowTemplate()
+	authoringTemplate := StandardAuthoringCurrentWorkflowTemplate()
 	standardProfile := explicitProfile(standardTemplate.Catalog)
-	codeEdgeProfile := explicitProfile(codeEdgeTemplate.Catalog)
+	authoringProfile := explicitProfile(authoringTemplate.Catalog)
 
-	if _, err := standardTemplate.Compile(codeEdgeProfile); err == nil || !strings.Contains(err.Error(), "template reference mismatch") {
-		t.Fatalf("standard compile with CodeEdge profile = %v, want exact-template rejection", err)
+	if _, err := standardTemplate.Compile(authoringProfile); err == nil || !strings.Contains(err.Error(), "template reference mismatch") {
+		t.Fatalf("standard compile with authoring profile = %v, want exact-template rejection", err)
 	}
-	if _, err := codeEdgeTemplate.Compile(standardProfile); err == nil || !strings.Contains(err.Error(), "template reference mismatch") {
-		t.Fatalf("CodeEdge compile with Standard profile = %v, want exact-template rejection", err)
+	if _, err := authoringTemplate.Compile(standardProfile); err == nil || !strings.Contains(err.Error(), "template reference mismatch") {
+		t.Fatalf("authoring compile with Standard profile = %v, want exact-template rejection", err)
 	}
 
 	templateLessProfile := standardProfile.Clone()
@@ -93,8 +89,8 @@ func TestExplicitTemplateBindingRejectsCrossTemplateAndTemplateLessDocuments(t *
 	}
 
 	standardSpec := testRunExecutionSpec(t)
-	if err := standardSpec.ValidateFor(codeEdgeTemplate.Catalog); err == nil || !strings.Contains(err.Error(), "template reference mismatch") {
-		t.Fatalf("Standard spec against CodeEdge catalog = %v, want cross-template rejection", err)
+	if err := standardSpec.ValidateFor(authoringTemplate.Catalog); err == nil || !strings.Contains(err.Error(), "template reference mismatch") {
+		t.Fatalf("Standard spec against authoring catalog = %v, want cross-template rejection", err)
 	}
 	templateLessSpec := standardSpec.Clone()
 	templateLessSpec.Template = TemplateReference{}
@@ -139,210 +135,38 @@ func TestExplicitTemplateBindingRejectsCrossTemplateAndTemplateLessDocuments(t *
 
 func TestTemplateReferenceParticipatesInProfileAndSpecFingerprints(t *testing.T) {
 	standardProfile := explicitProfile(StandardStageCatalog())
-	codeEdgeProfile := explicitProfile(CodeEdgePhase1StageCatalog())
+	authoringProfile := explicitProfile(StandardAuthoringCurrentWorkflowTemplate().Catalog)
 	standardProfileFingerprint, err := standardProfile.Fingerprint()
 	if err != nil {
 		t.Fatal(err)
 	}
-	codeEdgeProfileFingerprint, err := codeEdgeProfile.Fingerprint()
+	authoringProfileFingerprint, err := authoringProfile.Fingerprint()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if standardProfileFingerprint == codeEdgeProfileFingerprint {
+	if standardProfileFingerprint == authoringProfileFingerprint {
 		t.Fatal("template-bound profiles unexpectedly share a fingerprint")
 	}
 
 	standardSpec := testRunExecutionSpec(t)
-	codeEdgeSpec := testCodeEdgePhase1RunExecutionSpec(t)
+	authoringSpec := testStandardAuthoringExecutionSpec(t)
 	standardSpecFingerprint, err := standardSpec.Fingerprint()
 	if err != nil {
 		t.Fatal(err)
 	}
-	codeEdgeSpecFingerprint, err := codeEdgeSpec.Fingerprint()
+	authoringSpecFingerprint, err := authoringSpec.Fingerprint()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if standardSpecFingerprint == codeEdgeSpecFingerprint {
+	if standardSpecFingerprint == authoringSpecFingerprint {
 		t.Fatal("template-bound specifications unexpectedly share a fingerprint")
 	}
 
-	resolved, err := CodeEdgePhase1WorkflowTemplate().Compile(codeEdgeProfile)
+	resolved, err := StandardAuthoringCurrentWorkflowTemplate().Compile(authoringProfile)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !resolved.Template.Equal(CodeEdgePhase1TemplateReference()) || resolved.TemplateID != CodeEdgePhase1WorkflowTemplateID || resolved.TemplateVersion != CodeEdgePhase1WorkflowTemplateVersion {
-		t.Fatalf("resolved CodeEdge template identity = %#v / %s@%s", resolved.Template, resolved.TemplateID, resolved.TemplateVersion)
+	if !resolved.Template.Equal(StandardAuthoringCurrentTemplateReference()) || resolved.TemplateID != StandardAuthoringWorkflowTemplateID || resolved.TemplateVersion != StandardAuthoringContractTemplateVersion {
+		t.Fatalf("resolved authoring template identity = %#v / %s@%s", resolved.Template, resolved.TemplateID, resolved.TemplateVersion)
 	}
-}
-
-func TestCodeEdgePhase1TopologyUsesChildEvidenceHandoffBeforeFinalCompliance(t *testing.T) {
-	template := CodeEdgePhase1WorkflowTemplate()
-	if err := template.Validate(); err != nil {
-		t.Fatalf("validate CodeEdge Phase-1 template: %v", err)
-	}
-	if got, want := len(template.Catalog.Stages), len(CodeEdgePhase1StageOrder()); got != want {
-		t.Fatalf("CodeEdge stage count = %d, want %d", got, want)
-	}
-
-	resolved, err := template.Compile(explicitProfile(template.Catalog))
-	if err != nil {
-		t.Fatalf("compile CodeEdge Phase-1 template: %v", err)
-	}
-	order, err := resolved.Descriptor.TopologicalStages()
-	if err != nil {
-		t.Fatal(err)
-	}
-	positions := make(map[workflowkit.StageKey]int, len(order))
-	for index, key := range order {
-		positions[key] = index
-	}
-	for _, relation := range [][2]workflowkit.StageKey{
-		{workflowkit.StageKey(RepoPrepare), workflowkit.StageKey(DockerBuild)},
-		{workflowkit.StageKey(DockerBuild), workflowkit.StageKey(InitialVerify)},
-		{workflowkit.StageKey(InitialVerify), workflowkit.StageKey(OracleVerify)},
-		{workflowkit.StageKey(OracleVerify), workflowkit.StageKey(TestsAnalysis)},
-		{workflowkit.StageKey(TestsAnalysis), workflowkit.StageKey(SolutionReview)},
-		{workflowkit.StageKey(FinalReview), workflowkit.StageKey(EvaluatorEvidenceHandoff)},
-		{workflowkit.StageKey(EvaluatorEvidenceHandoff), workflowkit.StageKey(SubmissionLint)},
-		{workflowkit.StageKey(SubmissionLint), workflowkit.StageKey(ResultReview)},
-		{workflowkit.StageKey(ResultReview), workflowkit.StageKey(Package)},
-	} {
-		if positions[relation[0]] >= positions[relation[1]] {
-			t.Fatalf("CodeEdge topology puts %q at %d after %q at %d", relation[0], positions[relation[0]], relation[1], positions[relation[1]])
-		}
-	}
-	packageStage, present := template.Catalog.Stage(workflowkit.StageKey(Package))
-	if !present || !packageStage.Dispatch.IsOperatorOnly() || !sameStageKeySet(packageStage.Dependencies, []workflowkit.StageKey{workflowkit.StageKey(ResultReview)}) {
-		t.Fatalf("package dependencies = %#v, want only final ResultReview", packageStage.Dependencies)
-	}
-	initialPlan, err := workflowkit.CompileDependencyExecutionPlan(resolved.Descriptor)
-	if err != nil {
-		t.Fatalf("compile CodeEdge Phase-1 initial execution plan: %v", err)
-	}
-	var handoffPresent bool
-	for _, batch := range initialPlan.Batches {
-		for _, nodeID := range batch.NodeIDs {
-			if nodeID == workflowkit.NodeID(Package) {
-				t.Fatalf("CodeEdge initial plan scheduled operator-only package: %#v", initialPlan.Batches)
-			}
-			if nodeID == workflowkit.NodeID(HarborRunQwen) || nodeID == workflowkit.NodeID(HarborRunOpus) {
-				t.Fatalf("parent CodeEdge plan retained direct evaluator node %q: %#v", nodeID, initialPlan.Batches)
-			}
-			handoffPresent = handoffPresent || nodeID == workflowkit.NodeID(EvaluatorEvidenceHandoff)
-		}
-	}
-	if !handoffPresent {
-		t.Fatalf("CodeEdge initial plan omitted evaluator evidence handoff: %#v", initialPlan.Batches)
-	}
-	if _, present := template.Catalog.Stage(workflowkit.StageKey(HarborRunQwen)); present {
-		t.Fatal("parent CodeEdge template retains direct Qwen evaluator stage")
-	}
-	if _, present := template.Catalog.Stage(workflowkit.StageKey(HarborRunOpus)); present {
-		t.Fatal("parent CodeEdge template retains direct Opus evaluator stage")
-	}
-	handoff, present := template.Catalog.Stage(workflowkit.StageKey(EvaluatorEvidenceHandoff))
-	if !present || !handoff.IsGate() || handoff.Gate == nil || handoff.Gate.ReviewKind != ReviewEvaluatorEvidence || handoff.Gate.DecisionArtifact.Name != "evaluator_evidence_handoff_decision" {
-		t.Fatalf("CodeEdge evaluator evidence handoff gate = %#v", handoff)
-	}
-	compiledHandoff, present := resolved.Descriptor.Stage(workflowkit.StageKey(EvaluatorEvidenceHandoff))
-	if !present || compiledHandoff.Effect != workflowkit.EffectEvidenceOnly || len(compiledHandoff.QuotaClaims) != 0 || !compiledHandoff.Capabilities.Has(workflowkit.CapabilityApprove) {
-		t.Fatalf("compiled CodeEdge evaluator evidence handoff = %#v", compiledHandoff)
-	}
-	submission, _ := template.Catalog.Stage(workflowkit.StageKey(SubmissionLint))
-	resultReview, _ := template.Catalog.Stage(workflowkit.StageKey(ResultReview))
-	for _, stage := range []StageDefinition{submission, resultReview} {
-		for _, artifact := range stage.Inputs {
-			if artifact.Name == "qwen_trial_result" || artifact.Name == "opus_trial_result" {
-				t.Fatalf("parent stage %q consumes child evaluator artifact %q directly", stage.Key, artifact.Name)
-			}
-		}
-	}
-
-	broken := template.Catalog.Clone()
-	for index := range broken.Stages {
-		if broken.Stages[index].Key == workflowkit.StageKey(EvaluatorEvidenceHandoff) {
-			broken.Stages[index].Dependencies = []workflowkit.StageKey{workflowkit.StageKey(RepoPrepare)}
-		}
-	}
-	if err := broken.Validate(); err == nil || !strings.Contains(err.Error(), "frozen template topology") {
-		t.Fatalf("evaluator handoff topology mutation = %v, want rejection", err)
-	}
-}
-
-func TestCodeEdgePhase1SubmissionReportUsesTheVersionedTypedContract(t *testing.T) {
-	template := CodeEdgePhase1WorkflowTemplate()
-	if template.Version != "2.2.0" || template.Catalog.Version != "2.2.0" {
-		t.Fatalf("CodeEdge semantic schema change did not receive template/catalog versions: %s / %s", template.Version, template.Catalog.Version)
-	}
-	stages := make(map[workflowkit.StageKey]StageDefinition, len(template.Catalog.Stages))
-	for _, stage := range template.Catalog.Stages {
-		stages[stage.Key] = stage
-	}
-	assertSchema := func(stage workflowkit.StageKey, artifacts []workflowkit.ArtifactSpec) {
-		t.Helper()
-		found := false
-		for _, artifact := range artifacts {
-			if artifact.Name != "submission_lint_report" {
-				continue
-			}
-			found = true
-			if artifact.SchemaVersion != CodeEdgeSubmissionReportSchemaVersion {
-				t.Fatalf("stage %s submission_lint_report schema = %q, want %q", stage, artifact.SchemaVersion, CodeEdgeSubmissionReportSchemaVersion)
-			}
-		}
-		if !found {
-			t.Fatalf("stage %s omitted submission_lint_report", stage)
-		}
-	}
-	submission, submissionPresent := stages[workflowkit.StageKey(SubmissionLint)]
-	resultReview, resultReviewPresent := stages[workflowkit.StageKey(ResultReview)]
-	localPackage, packagePresent := stages[workflowkit.StageKey(Package)]
-	if !submissionPresent || !resultReviewPresent || !packagePresent {
-		t.Fatalf("CodeEdge schema contract stages = submission:%t review:%t package:%t", submissionPresent, resultReviewPresent, packagePresent)
-	}
-	assertSchema(submission.Key, submission.Outputs)
-	assertSchema(resultReview.Key, resultReview.Inputs)
-	assertSchema(localPackage.Key, localPackage.Inputs)
-}
-
-func testCodeEdgePhase1RunExecutionSpec(t *testing.T) RunExecutionSpec {
-	t.Helper()
-	const digest = "harbor.task.v2:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-	selection := RunSelectionReference{
-		TaskID: "018f0a73-3b49-7000-8000-000000000011", RevisionID: "018f0a73-3b49-7000-8000-000000000012", RevisionDigest: workflowkit.SubjectDigest(digest),
-	}
-	policy := testCodeEdgeFinalCompliancePolicy()
-	specification := RunExecutionSpec{
-		Format: RunExecutionSpecFormat, Version: RunExecutionSpecVersion, Template: CodeEdgePhase1TemplateReference(), Selection: selection,
-		CodeEdgeFinalCompliancePolicy: &policy,
-		References: ExecutionReferenceSet{
-			Artifacts: []ArtifactReference{{ID: "018f0a73-3b49-7000-8000-000000000013", ContentDigest: testFingerprint('d'), SchemaVersion: "harbor.artifact.v1"}},
-			Checkouts: []CheckoutReference{{ID: "checkout-codeedge", RevisionID: selection.RevisionID, RevisionDigest: selection.RevisionDigest}},
-			Runtimes:  []RuntimeReference{{ID: "runtime-codeedge", Kind: "controlled", Version: "1"}},
-			Providers: []ProviderReference{
-				{ID: "provider-codeedge-local", Kind: "native", Version: "1"},
-				{ID: "provider-codeedge-review", Kind: "durable-review", Version: "1"},
-			},
-		},
-	}
-	for _, definition := range CodeEdgePhase1StageCatalog().Stages {
-		base := StageBindingBase{
-			Type: bindingTypeForTest(definition.Key), StageKey: definition.Key,
-			Plugin:     workflowkit.PluginBinding{ID: definition.Plugin.ID, Version: definition.Plugin.Version},
-			CheckoutID: "checkout-codeedge", RuntimeID: "runtime-codeedge", ArtifactInputs: []ArtifactInputReference{}, SecretIDs: []string{},
-			Operation: StageOperationBinding{ProviderID: "provider-codeedge-local", OperationID: string(definition.Key), Version: "1", Payload: LocalCommandOperationPayload{CommandID: "codeedge-stage", Arguments: []string{string(definition.Key)}}},
-		}
-		switch definition.Key {
-		case workflowkit.StageKey(RepoPrepare):
-			base.ArtifactInputs = []ArtifactInputReference{{Port: "task_snapshot", ArtifactID: "018f0a73-3b49-7000-8000-000000000013"}}
-		case workflowkit.StageKey(SolutionReview), workflowkit.StageKey(FinalReview), workflowkit.StageKey(EvaluatorEvidenceHandoff), workflowkit.StageKey(ResultReview):
-			base.Operation.ProviderID = "provider-codeedge-review"
-			base.Operation.Payload = DurableReviewOperationPayload{PolicyID: "codeedge-review.v1"}
-		}
-		specification.Stages = append(specification.Stages, bindingForTest(t, base))
-	}
-	if err := specification.Validate(); err != nil {
-		t.Fatalf("build CodeEdge execution-spec fixture: %v", err)
-	}
-	return specification
 }

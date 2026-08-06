@@ -39,7 +39,7 @@ type StandardAuthoringOperationHandlers struct {
 // app, store, CLI, and TUI packages. The caller supplies a static parsed
 // catalog and lock plus handlers assembled by a deployment composition. The
 // exact Template field prevents a future closed authoring template from
-// accidentally reusing a Standard or CodeEdge resolver as a fallback.
+// accidentally reusing a different template's resolver as a fallback.
 type StandardAuthoringProviderCompositionConfig struct {
 	Template            workflowadapter.TemplateReference
 	Catalog             *DeploymentOperationCatalogResolver

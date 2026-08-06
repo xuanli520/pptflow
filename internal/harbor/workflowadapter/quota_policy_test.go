@@ -63,10 +63,6 @@ func TestStandardQuotaPolicyCompilesExplicitAccountLimitsAndStageClaims(t *testi
 	if !hasQuotaClaim(repoAnalyze.QuotaClaims, "agent_turn", 3) {
 		t.Fatalf("repo analysis claims = %+v, want three frozen agent turns", repoAnalyze.QuotaClaims)
 	}
-	qwen, _ := resolved.Descriptor.Stage(workflowkit.StageKey(HarborRunQwen))
-	if !hasQuotaClaim(qwen.QuotaClaims, "trial", 4) {
-		t.Fatalf("Qwen evaluation claims = %+v, want four logical trials", qwen.QuotaClaims)
-	}
 	repair, _ := resolved.Descriptor.Stage(workflowkit.StageKey(TaskRepair))
 	if !hasQuotaClaim(repair.QuotaClaims, "repair_round", 1) {
 		t.Fatalf("repair claims = %+v, want one repair round", repair.QuotaClaims)
@@ -113,46 +109,6 @@ func TestStandardAuthoringQuotaPolicySeparatelyBoundsOutputSubmissions(t *testin
 		if hasQuotaClaim(claims, "output_submission", StandardAuthoringOutputSubmissionClaimUnits) {
 			t.Fatalf("non-agent stage %q unexpectedly has output-submission quota: %+v", definition.Key, claims)
 		}
-	}
-}
-
-func TestCodeEdgePhase1QuotaPolicyLeavesEvaluatorTrialsToChild(t *testing.T) {
-	parent := CodeEdgePhase1WorkflowTemplate()
-	if parent.QuotaPolicy.ID != CodeEdgePhase1QuotaPolicyID || parent.QuotaPolicy.Version != CodeEdgePhase1QuotaPolicyVersion {
-		t.Fatalf("CodeEdge parent quota policy = %s@%s, want %s@%s", parent.QuotaPolicy.ID, parent.QuotaPolicy.Version, CodeEdgePhase1QuotaPolicyID, CodeEdgePhase1QuotaPolicyVersion)
-	}
-	if err := parent.QuotaPolicy.ValidateFor(parent.Catalog); err != nil {
-		t.Fatalf("validate CodeEdge parent quota policy: %v", err)
-	}
-	for _, limit := range parent.QuotaPolicy.AccountLimits {
-		if limit.Dimension == "trial" {
-			t.Fatalf("parent CodeEdge quota policy retained evaluator trial account: %#v", parent.QuotaPolicy.AccountLimits)
-		}
-	}
-	for _, stage := range parent.QuotaPolicy.Stages {
-		for _, claim := range stage.Claims {
-			if claim.Dimension == "trial" {
-				t.Fatalf("parent CodeEdge stage %q retained evaluator trial claim: %#v", stage.StageKey, stage.Claims)
-			}
-		}
-	}
-	resolved, err := parent.Compile(explicitProfile(parent.Catalog))
-	if err != nil {
-		t.Fatalf("compile CodeEdge parent: %v", err)
-	}
-	handoff, present := resolved.Descriptor.Stage(workflowkit.StageKey(EvaluatorEvidenceHandoff))
-	if !present || len(handoff.QuotaClaims) != 0 {
-		t.Fatalf("CodeEdge evaluator evidence handoff claims = %#v, want durable-gate empty claims", handoff.QuotaClaims)
-	}
-
-	child := CodeEdgeEvaluatorChildWorkflowTemplate()
-	resolvedChild, err := child.Compile(explicitProfile(child.Catalog))
-	if err != nil {
-		t.Fatalf("compile CodeEdge evaluator child: %v", err)
-	}
-	qwen, present := resolvedChild.QuotaPolicy.ClaimsFor(workflowkit.StageKey(HarborRunQwen))
-	if !present || !hasQuotaClaim(qwen, "trial", 4) {
-		t.Fatalf("CodeEdge evaluator child Qwen claims = %#v, want four logical trials", qwen)
 	}
 }
 

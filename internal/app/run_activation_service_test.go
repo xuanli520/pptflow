@@ -242,7 +242,7 @@ func TestRunWorkerEligibilityRejectsStaleCommandsOutsideActiveRun(t *testing.T) 
 	}{
 		{name: "review", status: store.WorkflowRunWaitingReview, allowed: store.ReviewGateResolutionCommandType, stale: "stage_attempt.execute"},
 		{name: "continuation", status: store.WorkflowRunWaitingContinuation, allowed: "task_continuation.execute", stale: "stage_attempt.execute"},
-		{name: "in doubt", status: store.WorkflowRunInDoubt, allowed: codeEdgeEvaluatorReconciliationCommandType, stale: "stage_attempt.execute"},
+		{name: "in doubt", status: store.WorkflowRunInDoubt, allowed: repairSessionAdvanceCommandType, stale: "stage_attempt.execute"},
 		{name: "terminal repair", status: store.WorkflowRunSucceeded, allowed: repairSessionAdvanceCommandType, stale: "workflow_run.execute"},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {

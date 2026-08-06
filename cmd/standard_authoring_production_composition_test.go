@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/app"
-	"github.com/purplevoid/harbor-factory/internal/harbor/codeedge"
 	"github.com/purplevoid/harbor-factory/internal/harbor/stageprovider"
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
@@ -37,12 +36,6 @@ func TestStandardAuthoringProductionCompositionBuildsItsOwnLockedRepoPrepareCapa
 	lockIdentity := stageprovider.DeploymentOperationCatalogLockIdentity{
 		LockID: lock.LockID, LockVersion: lock.LockVersion, Fingerprint: lockFingerprint,
 	}
-	admission := codeedge.TaskAdmissionContract{
-		ID: "codeedge-phase1-composition-test", Version: "1.0.0", Profile: codeEdgePhase1DefinitionProviderPreflightProfile(t),
-	}
-	if err := admission.Validate(); err != nil {
-		t.Fatalf("construct CodeEdge admission fixture: %v", err)
-	}
 	composition, err := newStandardAuthoringProductionComposition(standardAuthoringProductionCompositionConfig{
 		CatalogPath:               filepath.Join(deploymentRoot, "operation-catalog.v1.json"),
 		LockPath:                  filepath.Join(deploymentRoot, "operation-catalog.lock.json"),
@@ -52,7 +45,6 @@ func TestStandardAuthoringProductionCompositionBuildsItsOwnLockedRepoPrepareCapa
 		HarborFlowBuild:           lock.HarborFlowBuild,
 		CatalogReceiptFingerprint: receiptFingerprint,
 		LockIdentity:              lockIdentity,
-		AdmissionContract:         &admission,
 	})
 	if err != nil {
 		t.Fatalf("construct Standard authoring production composition: %v", err)
@@ -110,26 +102,6 @@ func TestStandardAuthoringProductionCompositionBuildsItsOwnLockedRepoPrepareCapa
 	}
 	if !catalog.Template().Equal(workflowadapter.StandardAuthoringCurrentTemplateReference()) {
 		t.Fatalf("test catalog template = %+v", catalog.Template())
-	}
-}
-
-func TestStandardAuthoringCandidateCommandTimeoutUsesHostCandidateVerifyAttemptBudget(t *testing.T) {
-	template := workflowadapter.StandardAuthoringCurrentWorkflowTemplate()
-	profile := standardAuthoringProductionTestProfile(t, template.Reference())
-	for index := range profile.Stages {
-		if profile.Stages[index].StageKey == workflowkit.StageKey(workflowadapter.HostCandidateVerify) {
-			profile.Stages[index].Budget.AttemptTimeout = 2*time.Hour + 10*time.Minute
-			profile.Stages[index].Budget.MaxElapsed = 2*time.Hour + 10*time.Minute
-			break
-		}
-	}
-
-	got, err := standardAuthoringCandidateCommandTimeout(profile)
-	if err != nil {
-		t.Fatalf("derive Standard authoring candidate command timeout: %v", err)
-	}
-	if want := 2*time.Hour + 10*time.Minute; got != want {
-		t.Fatalf("candidate command timeout = %s, want %s", got, want)
 	}
 }
 

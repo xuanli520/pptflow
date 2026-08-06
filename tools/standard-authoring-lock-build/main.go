@@ -32,13 +32,9 @@ const (
 )
 
 // generatedProductionLocks are omitted from the source manifest signed by
-// every deployment lock. Including even one lock would create a hash cycle;
-// excluding only the lock currently being generated would make the three
-// independent bundles sign different source identities.
+// the deployment lock. Including the lock would create a hash cycle.
 var generatedProductionLocks = map[string]struct{}{
-	"deployments/standard-authoring/operation-catalog.lock.json":       {},
-	"deployments/codeedge-phase1/operation-catalog.lock.json":          {},
-	"deployments/codeedge-evaluator-child/operation-catalog.lock.json": {},
+	"deployments/standard-authoring/operation-catalog.lock.json": {},
 }
 
 type buildConfig struct {

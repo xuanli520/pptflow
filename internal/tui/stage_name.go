@@ -45,10 +45,6 @@ func displayStageName(stage string) string {
 		return "初始失败验证"
 	case "oracle_verify":
 		return "参考解答验证"
-	case "harbor_run_qwen":
-		return "Qwen pass@4"
-	case "harbor_run_opus":
-		return "Opus pass@4"
 	default:
 		return stage
 	}

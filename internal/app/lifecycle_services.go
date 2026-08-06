@@ -53,60 +53,31 @@ type LifecycleServices struct {
 	// TaskBoard is the compact application boundary consumed by the terminal
 	// task board. It projects durable state and delegates its mutations to the
 	// existing authoring, review, and activation services.
-	TaskBoard          *TaskBoardService
-	CodeEdgeCompliance *CodeEdgeComplianceService
-	LocalRuntime       *LocalRuntimeService
-	WorkerHandoffs     *RunWorkerHandoffService
+	TaskBoard      *TaskBoardService
+	LocalRuntime   *LocalRuntimeService
+	WorkerHandoffs *RunWorkerHandoffService
 	// RunActivations consumes the durable local queue-delivery events that
 	// wake controlled child workers. It is optional in non-production
 	// compositions, where tests and read-only control planes intentionally do
 	// not spawn processes.
-	RunActivations    *RunActivationService
-	Mutations         *LifecycleMutationService
-	EvaluatorLaunches *CodeEdgeEvaluatorLaunchService
+	RunActivations *RunActivationService
+	Mutations      *LifecycleMutationService
 	// AuthoringLaunches owns source capture and the source/session half of a
 	// Standard task creation.
 	AuthoringLaunches *StandardAuthoringLaunchService
-	// EvaluatorEvidenceHandoffs records the immutable, verified bridge from a
-	// completed CodeEdge evaluator child Run to its approved Phase-1 parent.
-	// It is deliberately separate from launch and compliance: it never starts
-	// a provider or authorizes a package.
-	EvaluatorEvidenceHandoffs *CodeEdgeEvaluatorEvidenceHandoffService
 
 	core *lifecycleServiceCore
 }
 
 type lifecycleServiceCore struct {
-	store                *store.Store
-	layout               managedLayout
-	objects              *workflowruntime.ArtifactObjectStore
-	operationResolver    workflowadapter.StageOperationResolver
-	deploymentCatalogs   *deploymentCatalogRegistry
-	evaluatorDefinitions EvaluatorRunDefinitionProvider
-	evaluatorObserver    CodeEdgeEvaluatorCompletedObserver
-	now                  func() time.Time
-	changes              *ChangeProviderService
-	repairs              *RepairLoopService
-}
-
-// CodeEdgeEvaluatorObservationRequest carries the same frozen execution
-// capability that the original evaluator received. It is intentionally free
-// of host paths, environment values, secrets, or caller-provided command
-// arguments. A provider-specific observer may only inspect a deterministic
-// previously-created local job and report a completed result; it must never
-// launch, resume, or otherwise mutate an external evaluator.
-type CodeEdgeEvaluatorObservationRequest struct {
-	Execution  workflowkit.StageExecutionRequest
-	Resolution workflowadapter.StageOperationResolution
-}
-
-// CodeEdgeEvaluatorCompletedObserver is the narrow reconciliation port for
-// the closed Qwen/Opus Harbor evaluator. observed=false leaves the durable
-// Run, StageAttempt, and four logical TrialExecutions in_doubt. A successful
-// observation returns the exact immutable artifacts that the original stage
-// would have returned; it does not create another logical sample.
-type CodeEdgeEvaluatorCompletedObserver interface {
-	ObserveCompletedCodeEdgeEvaluator(context.Context, CodeEdgeEvaluatorObservationRequest) (workflowkit.StageExecutionResult, bool, error)
+	store              *store.Store
+	layout             managedLayout
+	objects            *workflowruntime.ArtifactObjectStore
+	operationResolver  workflowadapter.StageOperationResolver
+	deploymentCatalogs *deploymentCatalogRegistry
+	now                func() time.Time
+	changes            *ChangeProviderService
+	repairs            *RepairLoopService
 }
 
 // LifecycleServicesOptions supplies controlled integrations used by the V2
@@ -138,11 +109,6 @@ type LifecycleServicesOptions struct {
 	// supplied, is converted into one additional template-keyed binding; a
 	// duplicate template is rejected rather than becoming a fallback.
 	DeploymentCatalogResolvers []TemplateDeploymentCatalogResolver
-	// EvaluatorRunDefinitionProvider supplies the one already-attested
-	// CodeEdge evaluator child definition installed by deployment composition.
-	// CLI and TUI callers never provide its profile, execution specification,
-	// model selection, or stage operation data.
-	EvaluatorRunDefinitionProvider EvaluatorRunDefinitionProvider
 	// StandardAuthoringSourceCapturer and StandardAuthoringRunDefinitionProvider
 	// are the deployment-owned inputs for Standard authoring. The caller selects
 	// only a validated immutable HTTPS/SSH source coordinate; capture mechanics,
@@ -151,11 +117,6 @@ type LifecycleServicesOptions struct {
 	// rest of the lifecycle control plane.
 	StandardAuthoringSourceCapturer        StandardAuthoringSourceCapturer
 	StandardAuthoringRunDefinitionProvider StandardAuthoringRunDefinitionProvider
-	// CodeEdgeEvaluatorObserver is the deployment-owned, read-only recovery
-	// port for an already-started Qwen or Opus evaluator. It is optional for
-	// read/control-plane and test compositions; without it the runtime retains
-	// an uncertain effect as in_doubt rather than attempting a rerun.
-	CodeEdgeEvaluatorObserver CodeEdgeEvaluatorCompletedObserver
 	// RunWorkerHandoffLauncher is the composition-owned local process boundary
 	// used for automatic delivery of queued Run work. The application layer
 	// retains the durable reserve/spawn/claim protocol; this port only starts
@@ -211,14 +172,12 @@ func NewLifecycleServicesWithOptions(root string, dataStore *store.Store, option
 		return nil, err
 	}
 	core := &lifecycleServiceCore{
-		store:                dataStore,
-		layout:               layout,
-		objects:              objects,
-		operationResolver:    operationResolver,
-		deploymentCatalogs:   catalogRegistry,
-		evaluatorDefinitions: options.EvaluatorRunDefinitionProvider,
-		evaluatorObserver:    options.CodeEdgeEvaluatorObserver,
-		now:                  time.Now,
+		store:              dataStore,
+		layout:             layout,
+		objects:            objects,
+		operationResolver:  operationResolver,
+		deploymentCatalogs: catalogRegistry,
+		now:                time.Now,
 	}
 	activations := &RunActivationService{core: core, launcher: options.RunWorkerHandoffLauncher}
 	continuations := newTaskContinuationService(core)
@@ -234,36 +193,31 @@ func NewLifecycleServicesWithOptions(root string, dataStore *store.Store, option
 	control := &ExecutionControlService{core: core}
 	authoringReviews := &AuthoringReviewService{core: core}
 	authoringLaunches := newStandardAuthoringLaunchService(core, options.StandardAuthoringSourceCapturer, options.StandardAuthoringRunDefinitionProvider)
-	evaluatorLaunches := &CodeEdgeEvaluatorLaunchService{core: core, mutations: mutations, definitions: options.EvaluatorRunDefinitionProvider}
-	evaluatorEvidenceHandoffs := &CodeEdgeEvaluatorEvidenceHandoffService{core: core}
 	runs := &RunService{core: core}
-	taskBoard := newTaskBoardService(core, inspection, authoringLaunches, authoringReviews, mutations, activations, continuations, runs, control, evaluatorLaunches, evaluatorEvidenceHandoffs, options.RunWorkerHandoffLauncher)
+	taskBoard := newTaskBoardService(core, inspection, authoringLaunches, authoringReviews, mutations, activations, continuations, runs, control, options.RunWorkerHandoffLauncher)
 	services := &LifecycleServices{
-		Tasks:                     &TaskService{core: core},
-		Revisions:                 &RevisionService{core: core},
-		Runs:                      runs,
-		Reviews:                   &ReviewService{core: core},
-		AuthoringReviews:          authoringReviews,
-		Releases:                  &ReleaseService{core: core},
-		Deletion:                  &DeletionService{core: core},
-		Control:                   control,
-		Budgets:                   &BudgetGrantService{core: core},
-		Continuations:             continuations,
-		Changes:                   changes,
-		Repairs:                   repairs,
-		Candidates:                &CandidateRetentionService{core: core},
-		Transcripts:               &AgentTranscriptRetentionService{core: core},
-		Inspection:                inspection,
-		TaskBoard:                 taskBoard,
-		CodeEdgeCompliance:        &CodeEdgeComplianceService{core: core},
-		LocalRuntime:              &LocalRuntimeService{core: core},
-		WorkerHandoffs:            &RunWorkerHandoffService{core: core},
-		RunActivations:            activations,
-		Mutations:                 mutations,
-		EvaluatorLaunches:         evaluatorLaunches,
-		AuthoringLaunches:         authoringLaunches,
-		EvaluatorEvidenceHandoffs: evaluatorEvidenceHandoffs,
-		core:                      core,
+		Tasks:             &TaskService{core: core},
+		Revisions:         &RevisionService{core: core},
+		Runs:              runs,
+		Reviews:           &ReviewService{core: core},
+		AuthoringReviews:  authoringReviews,
+		Releases:          &ReleaseService{core: core},
+		Deletion:          &DeletionService{core: core},
+		Control:           control,
+		Budgets:           &BudgetGrantService{core: core},
+		Continuations:     continuations,
+		Changes:           changes,
+		Repairs:           repairs,
+		Candidates:        &CandidateRetentionService{core: core},
+		Transcripts:       &AgentTranscriptRetentionService{core: core},
+		Inspection:        inspection,
+		TaskBoard:         taskBoard,
+		LocalRuntime:      &LocalRuntimeService{core: core},
+		WorkerHandoffs:    &RunWorkerHandoffService{core: core},
+		RunActivations:    activations,
+		Mutations:         mutations,
+		AuthoringLaunches: authoringLaunches,
+		core:              core,
 	}
 	services.LocalRuntime.services = services
 	return services, nil
@@ -305,10 +259,9 @@ func (services *LifecycleServices) CatalogLockAttestedWorkflowkitProviderResolve
 
 // WorkflowkitProviderOperationResolver exposes the controlled production
 // provider boundary installed by composition. It can be either one
-// catalog-lock-attested template bundle or the explicit template router used
-// by a packaged Standard -> Phase-1 -> evaluator installation. Nil means this
-// is a read/control-plane composition and the worker must retain its rejecting
-// provider resolver.
+// catalog-lock-attested template bundle or the explicit template router. Nil
+// means this is a read/control-plane composition and the worker must retain
+// its rejecting provider resolver.
 func (services *LifecycleServices) WorkflowkitProviderOperationResolver() stageprovider.WorkflowkitProviderOperationResolver {
 	if services == nil || services.core == nil {
 		return nil
@@ -1413,10 +1366,10 @@ func (service *RunService) StartRun(ctx context.Context, request StartRunRequest
 }
 
 // resolveFrozenRunTemplate resolves the single closed workflow template that
-// both explicit Run inputs claim to use.  Profile and execution specification
+// both explicit Run inputs claim to use. Profile and execution specification
 // are independently caller-controlled files before StartRun freezes them, so
-// accepting one of them while silently compiling the other against Standard
-// would make a CodeEdge run execute a different DAG than the one it sealed.
+// accepting one of them while silently compiling the other against the other
+// would execute a different DAG than the one it sealed.
 //
 // There is deliberately no default or "current template" fallback here.  The
 // closed registry owns availability, and both references must be present,

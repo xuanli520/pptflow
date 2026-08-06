@@ -21,8 +21,8 @@ func newAuthoringStartCommand(config *lifecycleCLIConfig) *cobra.Command {
 		Short: "Capture an immutable Git source and start Standard authoring",
 		Long: `Capture one HTTPS or SSH Git repository at an exact full commit as a managed immutable source object,
 create a revision-free draft Task and AuthoringSession, then queue the closed
-Standard authoring Run. The generated TaskRevision and later CodeEdge workflow
-begin only after the authoring materialization handoff. The caller must provide
+Standard authoring Run. The generated TaskRevision begins only after the
+authoring materialization handoff. The caller must provide
 one fully-qualified base image pinned by a SHA-256 digest; that image is frozen
 into the AuthoringSession task contract.`,
 		Args: cobra.NoArgs,

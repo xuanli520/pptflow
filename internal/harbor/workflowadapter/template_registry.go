@@ -79,13 +79,9 @@ func templateKey(reference TemplateReference) templateReferenceKey {
 func DefaultTemplateRegistry() TemplateRegistry {
 	standard := StandardWorkflowTemplate()
 	standardAuthoringContract := StandardAuthoringContractWorkflowTemplate()
-	codeEdge := CodeEdgePhase1WorkflowTemplate()
-	codeEdgeEvaluator := CodeEdgeEvaluatorChildWorkflowTemplate()
 	return TemplateRegistry{templates: map[templateReferenceKey]WorkflowTemplate{
 		templateKey(standard.Reference()):                  standard,
 		templateKey(standardAuthoringContract.Reference()): standardAuthoringContract,
-		templateKey(codeEdge.Reference()):                  codeEdge,
-		templateKey(codeEdgeEvaluator.Reference()):         codeEdgeEvaluator,
 	}}
 }
 
@@ -114,8 +110,6 @@ func BuiltinTemplateReferences() []TemplateReference {
 	references := []TemplateReference{
 		StandardTemplateReference(),
 		StandardAuthoringContractTemplateReference(),
-		CodeEdgePhase1TemplateReference(),
-		CodeEdgeEvaluatorChildTemplateReference(),
 	}
 	sort.Slice(references, func(left, right int) bool {
 		if references[left].ID != references[right].ID {
@@ -128,9 +122,7 @@ func BuiltinTemplateReferences() []TemplateReference {
 
 func isBuiltinTemplateReference(reference TemplateReference) bool {
 	return reference.Equal(StandardTemplateReference()) ||
-		reference.Equal(StandardAuthoringContractTemplateReference()) ||
-		reference.Equal(CodeEdgePhase1TemplateReference()) ||
-		reference.Equal(CodeEdgeEvaluatorChildTemplateReference())
+		reference.Equal(StandardAuthoringContractTemplateReference())
 }
 
 // errTemplateMismatch lets callers distinguish a cross-template profile/spec

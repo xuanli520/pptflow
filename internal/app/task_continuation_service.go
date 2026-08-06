@@ -1108,16 +1108,13 @@ func continuationTargets(command normalizedContinuationCommand, run store.Workfl
 			return rejectContentContinuationTargets(workflow, targets)
 		}
 		// A pre-materialization authoring recovery may re-schedule content
-		// stages inside the same frozen source/session subject, but CodeEdge
-		// evaluator and operator-only stages still require their dedicated
-		// lifecycle operations.
+		// stages inside the same frozen source/session subject, but
+		// operator-only stages still require their dedicated lifecycle
+		// operations.
 		for _, nodeID := range targets {
 			stage, exists := workflow.Stage(nodeID)
 			if !exists {
 				return fmt.Errorf("%w: unknown frozen stage %q", ErrTaskContinuationTarget, nodeID)
-			}
-			if isCodeEdgeEvaluatorNode(workflow, nodeID) {
-				return fmt.Errorf("%w: CodeEdge evaluator stage %q requires TrialExecution reconciliation and cannot use an ordinary stage retry", ErrTaskContinuationTarget, nodeID)
 			}
 			if stage.OperatorOnly() {
 				return fmt.Errorf("%w: stage %q is operator-only and requires its explicit lifecycle operation", ErrTaskContinuationTarget, nodeID)
@@ -1212,9 +1209,6 @@ func rejectContentContinuationTargets(workflow workflowkit.WorkflowDescriptor, t
 		stage, exists := workflow.Stage(nodeID)
 		if !exists {
 			return fmt.Errorf("%w: unknown frozen stage %q", ErrTaskContinuationTarget, nodeID)
-		}
-		if isCodeEdgeEvaluatorNode(workflow, nodeID) {
-			return fmt.Errorf("%w: CodeEdge evaluator stage %q requires TrialExecution reconciliation and cannot use an ordinary stage retry", ErrTaskContinuationTarget, nodeID)
 		}
 		if isContentChangingStage(stage) {
 			return fmt.Errorf("%w: stage %q requires a candidate revision and ChangeProvider transaction", ErrTaskContinuationTarget, nodeID)

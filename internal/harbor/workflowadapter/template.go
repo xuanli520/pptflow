@@ -261,25 +261,6 @@ func (profile ExecutionProfile) ValidateFor(catalog StageCatalog) error {
 			return fmt.Errorf("%w: execution profile contains unknown Harbor node %q", errInvalidCatalog, key)
 		}
 	}
-	if err := profile.validateCodeEdgeEvaluatorChildPolicy(); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (profile ExecutionProfile) validateCodeEdgeEvaluatorChildPolicy() error {
-	if !profile.Template.Equal(CodeEdgeEvaluatorChildTemplateReference()) {
-		return nil
-	}
-	for _, key := range CodeEdgeEvaluatorChildStageOrder() {
-		budget, present := profile.Budget(key)
-		if !present {
-			return fmt.Errorf("%w: CodeEdge evaluator child profile omits stage %q", errInvalidCatalog, key)
-		}
-		if budget.MaxAttempts != 1 {
-			return fmt.Errorf("%w: CodeEdge evaluator child stage %q requires max_attempts=1", errInvalidCatalog, key)
-		}
-	}
 	return nil
 }
 

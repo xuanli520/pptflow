@@ -172,7 +172,7 @@ func TestTypedLifecycleMutationCommandsExposeUUIDv7KeysAndRetireUnownedIdentityF
 	}
 	packageCommand, _, err := newReleaseCommand(config).Find([]string{"package"})
 	if err != nil || packageCommand == nil || packageCommand.Flags().Lookup("run") == nil {
-		t.Fatalf("release package must expose the explicit CodeEdge --run selector: command=%v err=%v", packageCommand, err)
+		t.Fatalf("release package must expose the explicit --run selector: command=%v err=%v", packageCommand, err)
 	}
 
 	for _, testCase := range []struct {

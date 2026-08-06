@@ -6,7 +6,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/purplevoid/harbor-factory/internal/harbor/codeedge"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
@@ -138,143 +137,17 @@ func TestRunExecutionSpecStrictJSONDecoder(t *testing.T) {
 	unknownBinding := []byte(strings.Replace(string(raw), `"type":"repo_prepare"`, `"type":"repo_prepare","unexpected":true`, 1))
 	duplicateRoot := []byte(strings.Replace(string(raw), `"format":"harbor.run-execution-spec.v1"`, `"format":"harbor.run-execution-spec.v1","format":"harbor.run-execution-spec.v1"`, 1))
 	unknownType := []byte(strings.Replace(string(raw), `"type":"repo_prepare"`, `"type":"not-a-stage"`, 1))
-	legacyDeploymentContract := append([]byte(`{"codeedge_phase1_deployment_contract":{"id":"legacy","version":"1","fingerprint":"sha256:legacy"},`), raw[1:]...)
 	trailing := append(append([]byte(nil), raw...), []byte(" null")...)
 	for name, malformed := range map[string][]byte{
-		"unknown root field":                unknownRoot,
-		"unknown binding field":             unknownBinding,
-		"duplicate root field":              duplicateRoot,
-		"unknown discriminator":             unknownType,
-		"removed deployment contract field": legacyDeploymentContract,
-		"trailing value":                    trailing,
+		"unknown root field":    unknownRoot,
+		"unknown binding field": unknownBinding,
+		"duplicate root field":  duplicateRoot,
+		"unknown discriminator": unknownType,
+		"trailing value":        trailing,
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := ParseRunExecutionSpecJSON(malformed); err == nil {
 				t.Fatalf("malformed JSON accepted: %s", malformed)
-			}
-		})
-	}
-}
-
-func TestRunExecutionSpecScopesCodeEdgeFinalCompliancePolicyToCodeEdgeTemplate(t *testing.T) {
-	standard := testRunExecutionSpec(t)
-	policy := testCodeEdgeFinalCompliancePolicy()
-	standard.CodeEdgeFinalCompliancePolicy = &policy
-	if err := standard.Validate(); err == nil || !strings.Contains(err.Error(), "not accepted") {
-		t.Fatalf("standard execution spec with CodeEdge policy = %v, want template-scoped rejection", err)
-	}
-
-	standardRaw, err := json.Marshal(testRunExecutionSpec(t))
-	if err != nil {
-		t.Fatalf("marshal standard execution spec: %v", err)
-	}
-	if strings.Contains(string(standardRaw), `"codeedge_final_compliance_policy"`) {
-		t.Fatal("standard execution spec marshal emitted a CodeEdge-only policy field")
-	}
-	standardWithNullPolicy := append([]byte(`{"codeedge_final_compliance_policy":null,`), standardRaw[1:]...)
-	if _, err := ParseRunExecutionSpecJSON(standardWithNullPolicy); err == nil {
-		t.Fatal("standard execution spec parser accepted an explicit CodeEdge policy field")
-	}
-
-	codeEdge := testCodeEdgePhase1RunExecutionSpec(t)
-	if codeEdge.CodeEdgeFinalCompliancePolicy == nil {
-		t.Fatal("CodeEdge fixture has no final compliance policy")
-	}
-	codeEdge.CodeEdgeFinalCompliancePolicy = nil
-	if err := codeEdge.Validate(); err == nil || !strings.Contains(err.Error(), "requires a final compliance policy") {
-		t.Fatalf("CodeEdge execution spec without policy = %v, want required-policy rejection", err)
-	}
-}
-
-func TestCodeEdgeFinalCompliancePolicyRoundTripStrictnessCanonicalizationAndClone(t *testing.T) {
-	specification := testCodeEdgePhase1RunExecutionSpec(t)
-	raw, err := json.Marshal(specification)
-	if err != nil {
-		t.Fatalf("marshal CodeEdge execution spec: %v", err)
-	}
-	if !strings.Contains(string(raw), `"codeedge_final_compliance_policy"`) {
-		t.Fatal("CodeEdge execution spec marshal omitted final compliance policy")
-	}
-	parsed, err := ParseRunExecutionSpecJSON(raw)
-	if err != nil {
-		t.Fatalf("parse valid CodeEdge execution spec: %v", err)
-	}
-	if parsed.CodeEdgeFinalCompliancePolicy == nil {
-		t.Fatal("parsed CodeEdge execution spec lost final compliance policy")
-	}
-	if got, want := parsed.CodeEdgeFinalCompliancePolicy.QwenPolicy.Evaluator.ModelName, specification.CodeEdgeFinalCompliancePolicy.QwenPolicy.Evaluator.ModelName; got != want {
-		t.Fatalf("parsed Qwen model = %q, want %q", got, want)
-	}
-	canonical, err := specification.CanonicalJSON()
-	if err != nil {
-		t.Fatalf("canonicalize original CodeEdge execution spec: %v", err)
-	}
-	parsedCanonical, err := parsed.CanonicalJSON()
-	if err != nil {
-		t.Fatalf("canonicalize parsed CodeEdge execution spec: %v", err)
-	}
-	if string(parsedCanonical) != string(canonical) {
-		t.Fatalf("CodeEdge execution spec canonical round trip changed:\n%s\n!=\n%s", parsedCanonical, canonical)
-	}
-	remarshaled, err := json.Marshal(parsed)
-	if err != nil {
-		t.Fatalf("re-marshal parsed CodeEdge execution spec: %v", err)
-	}
-	reparsed, err := ParseRunExecutionSpecJSON(remarshaled)
-	if err != nil {
-		t.Fatalf("re-parse marshaled CodeEdge execution spec: %v", err)
-	}
-	originalPolicyFingerprint, err := specification.CodeEdgeFinalCompliancePolicy.Fingerprint()
-	if err != nil {
-		t.Fatalf("fingerprint original CodeEdge policy: %v", err)
-	}
-	reparsedPolicyFingerprint, err := reparsed.CodeEdgeFinalCompliancePolicy.Fingerprint()
-	if err != nil {
-		t.Fatalf("fingerprint re-parsed CodeEdge policy: %v", err)
-	}
-	if reparsedPolicyFingerprint != originalPolicyFingerprint {
-		t.Fatalf("CodeEdge policy marshal/parse changed fingerprint: %q != %q", reparsedPolicyFingerprint, originalPolicyFingerprint)
-	}
-
-	baseline, err := specification.Fingerprint()
-	if err != nil {
-		t.Fatalf("fingerprint CodeEdge execution spec: %v", err)
-	}
-	reordered := specification.Clone()
-	reverseStrings(reordered.CodeEdgeFinalCompliancePolicy.QwenPolicy.InfraExceptionTypes)
-	reverseStrings(reordered.CodeEdgeFinalCompliancePolicy.OpusPolicy.InfraExceptionTypes)
-	reorderedFingerprint, err := reordered.Fingerprint()
-	if err != nil {
-		t.Fatalf("fingerprint reordered CodeEdge policy: %v", err)
-	}
-	if reorderedFingerprint != baseline {
-		t.Fatalf("policy exception order changed execution-spec fingerprint: %q != %q", reorderedFingerprint, baseline)
-	}
-
-	changed := specification.Clone()
-	changed.CodeEdgeFinalCompliancePolicy.QwenPolicy.Evaluator.ModelName = "another-approved-model"
-	changedFingerprint, err := changed.Fingerprint()
-	if err != nil {
-		t.Fatalf("fingerprint changed CodeEdge policy: %v", err)
-	}
-	if changedFingerprint == baseline {
-		t.Fatal("changing the frozen CodeEdge policy did not change execution-spec fingerprint")
-	}
-	clone := specification.Clone()
-	clone.CodeEdgeFinalCompliancePolicy.QwenPolicy.InfraExceptionTypes[0] = "ChangedException"
-	if specification.CodeEdgeFinalCompliancePolicy.QwenPolicy.InfraExceptionTypes[0] == "ChangedException" {
-		t.Fatal("CodeEdge policy clone mutated the original execution spec")
-	}
-
-	unknownPolicyField := []byte(strings.Replace(string(raw), `"id":"codeedge.phase1.final-compliance"`, `"id":"codeedge.phase1.final-compliance","unexpected":true`, 1))
-	duplicatePolicyField := []byte(strings.Replace(string(raw), `"id":"codeedge.phase1.final-compliance"`, `"id":"codeedge.phase1.final-compliance","id":"codeedge.phase1.final-compliance"`, 1))
-	for name, malformed := range map[string][]byte{
-		"unknown policy field":   unknownPolicyField,
-		"duplicate policy field": duplicatePolicyField,
-	} {
-		t.Run(name, func(t *testing.T) {
-			if _, err := ParseRunExecutionSpecJSON(malformed); err == nil {
-				t.Fatalf("malformed CodeEdge policy accepted: %s", malformed)
 			}
 		})
 	}
@@ -361,54 +234,6 @@ func TestRunExecutionSpecValidatesArtifactReferencesAndUsage(t *testing.T) {
 	}
 }
 
-func TestRunExecutionSpecBindsOnlyIntrinsicManagedArtifactInput(t *testing.T) {
-	specification := testCodeEdgePhase1RunExecutionSpec(t)
-	managed := ArtifactReference{
-		ID: "018f0a73-3b49-7000-8000-0000000000ff", ContentDigest: testFingerprint('e'), SchemaVersion: "harbor.artifact.v1",
-	}
-	bound, err := specification.BindManagedArtifactInput("task_snapshot", managed)
-	if err != nil {
-		t.Fatalf("bind intrinsic task snapshot: %v", err)
-	}
-	if err := bound.Validate(); err != nil {
-		t.Fatalf("validate bound execution spec: %v", err)
-	}
-	foundReference := false
-	for _, reference := range bound.References.Artifacts {
-		if reference.ID == managed.ID {
-			foundReference = reference.ContentDigest == managed.ContentDigest && reference.SchemaVersion == managed.SchemaVersion
-		}
-	}
-	if !foundReference {
-		t.Fatalf("bound execution spec did not retain managed artifact reference: %+v", bound.References.Artifacts)
-	}
-	for _, stage := range CodeEdgePhase1StageCatalog().Stages {
-		usesSnapshot := false
-		for _, input := range stage.Inputs {
-			usesSnapshot = usesSnapshot || input.Name == "task_snapshot"
-		}
-		if !usesSnapshot {
-			continue
-		}
-		resolution, err := bound.ResolveStageOperation(stage.Key)
-		if err != nil {
-			t.Fatal(err)
-		}
-		matched := false
-		for _, input := range resolution.ArtifactInputs {
-			if input.Port == "task_snapshot" {
-				matched = input.ArtifactID == managed.ID
-			}
-		}
-		if !matched {
-			t.Fatalf("stage %q does not bind managed task_snapshot", stage.Key)
-		}
-	}
-	if _, err := testRunExecutionSpec(t).BindManagedArtifactInput("task_snapshot", managed); err == nil {
-		t.Fatal("accepted a managed binding for standard task_snapshot, which has workflow producers")
-	}
-}
-
 func TestRunExecutionSpecRequiresExactStageOperationProviderBinding(t *testing.T) {
 	missingOperation := testRunExecutionSpec(t)
 	base, ok := stageBindingBaseOf(missingOperation.Stages[0])
@@ -435,17 +260,6 @@ func TestRunExecutionSpecRequiresExactStageOperationProviderBinding(t *testing.T
 
 func TestRunExecutionSpecResolvesAndPreflightsEveryFrozenOperation(t *testing.T) {
 	spec := testRunExecutionSpec(t)
-	resolved, err := spec.ResolveStageOperation("harbor_run_qwen")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resolved.StageType != StageBindingHarborRunQwen || resolved.Provider.ID != "provider-evaluator" || resolved.Operation.OperationID != "harbor_run_qwen" || resolved.Plugin.ID != "harborfactory.harbor_run_qwen" {
-		t.Fatalf("unexpected resolved operation: %+v", resolved)
-	}
-	if resolved.Runtime.ID != "runtime-evaluator" || len(resolved.Secrets) != 2 {
-		t.Fatalf("resolved evaluator references = %+v", resolved)
-	}
-
 	seen := make(map[workflowkit.StageKey]StageOperationResolution)
 	if err := spec.ValidateWithOperationResolver(stageOperationResolverFunc(func(resolution StageOperationResolution) error {
 		seen[resolution.StageKey] = resolution
@@ -484,16 +298,13 @@ func testRunExecutionSpec(t *testing.T) RunExecutionSpec {
 			},
 			Runtimes: []RuntimeReference{
 				{ID: "runtime-local", Kind: "local", Version: "1"},
-				{ID: "runtime-evaluator", Kind: "container", Version: "1"},
 			},
 			Providers: []ProviderReference{
 				{ID: "provider-local", Kind: "native", Version: "1"},
-				{ID: "provider-evaluator", Kind: "evaluation", Version: "1"},
 				{ID: "provider-review", Kind: "durable-review", Version: "1"},
 			},
 			Secrets: []SecretReference{
 				{ID: "secret-repository", Provider: "local-keyring", Version: "1"},
-				{ID: "secret-evaluator", Provider: "local-keyring", Version: "1"},
 			},
 		},
 	}
@@ -508,7 +319,7 @@ func testRunExecutionSpec(t *testing.T) RunExecutionSpec {
 			},
 		}
 		switch definition.Key {
-		case "task_review", "content_review", "solution_review", "final_review", "result_review":
+		case "task_review", "content_review", "solution_review", "final_review":
 			base.Operation.ProviderID = "provider-review"
 			base.Operation.Payload = DurableReviewOperationPayload{PolicyID: "harbor-review.v1"}
 		case "repo_prepare":
@@ -519,21 +330,6 @@ func testRunExecutionSpec(t *testing.T) RunExecutionSpec {
 			base.ArtifactInputs = []ArtifactInputReference{{Port: "repo_prepared", ArtifactID: "018f0a73-3b49-7000-8000-000000000003"}, {Port: "repo_analysis", ArtifactID: "018f0a73-3b49-7000-8000-000000000004"}}
 		case "generate_task_files":
 			base.ArtifactInputs = []ArtifactInputReference{{Port: "repo_prepared", ArtifactID: "018f0a73-3b49-7000-8000-000000000003"}, {Port: "repo_analysis", ArtifactID: "018f0a73-3b49-7000-8000-000000000004"}, {Port: "task_proposal", ArtifactID: "018f0a73-3b49-7000-8000-000000000005"}}
-		case "harbor_run_qwen":
-			base.RuntimeID = "runtime-evaluator"
-			base.Operation.ProviderID = "provider-evaluator"
-			base.Operation.Payload = ContainerCommandOperationPayload{
-				ImageDigest: "registry.example/harbor/evaluator@sha256:" + strings.Repeat("f", 64),
-				Command:     []string{"harbor-evaluator", string(definition.Key)},
-			}
-			base.SecretIDs = []string{"secret-evaluator", "secret-repository"}
-		case "harbor_run_opus":
-			base.RuntimeID = "runtime-evaluator"
-			base.Operation.ProviderID = "provider-evaluator"
-			base.Operation.Payload = ContainerCommandOperationPayload{
-				ImageDigest: "registry.example/harbor/evaluator@sha256:" + strings.Repeat("f", 64),
-				Command:     []string{"harbor-evaluator", string(definition.Key)},
-			}
 		case "package":
 			base.CheckoutID = "checkout-package"
 		}
@@ -592,50 +388,13 @@ func testStandardAuthoringExecutionSpec(t *testing.T) RunExecutionSpec {
 	spec.Stages = stages
 	spec.References.Checkouts = []CheckoutReference{spec.References.Checkouts[0]}
 	spec.References.Runtimes = []RuntimeReference{spec.References.Runtimes[0]}
-	spec.References.Providers = []ProviderReference{spec.References.Providers[0], spec.References.Providers[2]}
+	spec.References.Providers = []ProviderReference{spec.References.Providers[0], spec.References.Providers[1]}
 	spec.References.Secrets = []SecretReference{spec.References.Secrets[0]}
 	// The 3.0 source-session descriptor accepts its only root contract through
 	// managed binding at admission. No synthetic task-revision artifact is a
 	// reachable execution-spec input.
 	spec.References.Artifacts = []ArtifactReference{}
 	return spec
-}
-
-func testCodeEdgeFinalCompliancePolicy() codeedge.FinalCompliancePolicy {
-	maximumPassingTrials := 1
-	qwen := codeedge.EvaluationPolicy{
-		ID:                   "codeedge.qwen.pass-at-four",
-		Version:              "1",
-		HarborEvidenceFormat: codeedge.HarborRunBundleV018Format,
-		Evaluator: codeedge.EvaluatorIdentity{
-			ProfileID: "codeedge-qwen-profile", ProfileVersion: "1",
-			AgentName: "codeedge-agent", AgentVersion: "1",
-			ModelName: "qwen-approved-model", ModelProvider: "controlled-provider",
-		},
-		LogicalTrialCount:        4,
-		PassRewardKey:            "reward",
-		PassRewardAtLeast:        1,
-		MaxPassingTrials:         &maximumPassingTrials,
-		MinimumAverageTurns:      20,
-		ScreenshotMediaType:      "image/png",
-		FailureClassifierID:      "codeedge-infra-classifier",
-		FailureClassifierVersion: "1",
-		InfraExceptionTypes:      []string{"DockerBuildError", "NetworkError"},
-	}
-	opus := qwen.Clone()
-	opus.ID = "codeedge.opus.reference"
-	opus.Evaluator.ProfileID = "codeedge-opus-profile"
-	opus.Evaluator.ModelName = "opus-reference-model"
-	opus.MaxPassingTrials = nil
-	return codeedge.FinalCompliancePolicy{
-		ID:                            "codeedge.phase1.final-compliance",
-		Version:                       "1",
-		QwenPolicy:                    qwen,
-		OpusPolicy:                    opus,
-		SubmissionCheckerID:           "codeedge.submission-check",
-		SubmissionCheckerVersion:      "1",
-		SubmissionReportSchemaVersion: CodeEdgeSubmissionReportSchemaVersion,
-	}
 }
 
 func bindingForTest(t *testing.T, base StageBindingBase) StageExecutionBinding {
@@ -702,16 +461,6 @@ func bindingTypeForTest(key workflowkit.StageKey) StageBindingType {
 		return StageBindingSimilarityCheck
 	case "final_review":
 		return StageBindingFinalReview
-	case "harbor_run_qwen":
-		return StageBindingHarborRunQwen
-	case "harbor_run_opus":
-		return StageBindingHarborRunOpus
-	case "evaluator_evidence_handoff":
-		return StageBindingEvaluatorEvidenceHandoff
-	case "result_review":
-		return StageBindingResultReview
-	case "submission_lint":
-		return StageBindingSubmissionLint
 	case "package":
 		return StageBindingPackage
 	case "repo_structure_research":

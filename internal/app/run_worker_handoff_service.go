@@ -43,10 +43,10 @@ type ReserveRunWorkerHandoffCommand struct {
 // service, so callers cannot redirect a durable worker at an unrelated local
 // control plane.
 type RunWorkerHandoffLaunchRequest struct {
-	ManagedRoot       string
-	RunID             string
-	Owner             string
-	Reason            string
+	ManagedRoot        string
+	RunID              string
+	Owner              string
+	Reason             string
 	HandoffOperationID string
 }
 

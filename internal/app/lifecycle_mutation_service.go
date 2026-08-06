@@ -28,19 +28,10 @@ const (
 	LifecycleMutationSoftDelete  LifecycleMutationAction = "task.soft_delete"
 	LifecycleMutationRestore     LifecycleMutationAction = "task.restore"
 	LifecycleMutationStartRun    LifecycleMutationAction = "run.start"
-	// LifecycleMutationCodeEdgeEvaluator records the strict child Run used to
-	// collect the Qwen then Opus pass@4 evidence for one approved Phase-1 Run.
-	// It is distinct from generic run.start so a frozen generic input bundle can
-	// never be replayed as a production evaluator invocation.
-	LifecycleMutationCodeEdgeEvaluator LifecycleMutationAction = "run.codeedge_evaluator"
-	// LifecycleMutationCodeEdgeEvaluatorEvidenceHandoff adopts one completed
-	// child Run's verified evidence into its Phase-1 parent. It is not a generic
-	// artifact import and accepts no caller-supplied receipt bytes.
-	LifecycleMutationCodeEdgeEvaluatorEvidenceHandoff LifecycleMutationAction = "run.codeedge_evaluator_evidence_handoff"
-	LifecycleMutationPackage                          LifecycleMutationAction = "release.local_package"
-	LifecycleMutationWithdraw                         LifecycleMutationAction = "release.withdraw"
-	LifecycleMutationEdit                             LifecycleMutationAction = "task.edit"
-	LifecycleMutationReview                           LifecycleMutationAction = "review.decide"
+	LifecycleMutationPackage     LifecycleMutationAction = "release.local_package"
+	LifecycleMutationWithdraw    LifecycleMutationAction = "release.withdraw"
+	LifecycleMutationEdit        LifecycleMutationAction = "task.edit"
+	LifecycleMutationReview      LifecycleMutationAction = "review.decide"
 )
 
 // LifecycleMutationCheckpoint is the complete optimistic identity captured by
@@ -56,18 +47,12 @@ type LifecycleMutationCheckpoint struct {
 	RunVersion           int64  `json:"run_version,omitempty"`
 	RunExecutionEpoch    int    `json:"run_execution_epoch,omitempty"`
 	RunDefinitionHash    string `json:"run_definition_hash,omitempty"`
-	// CodeEdgeComplianceRecordID and CodeEdgeAuthorizationFingerprint bind a
-	// package confirmation to the exact immutable authorization observed for
-	// its selected Run. They are populated only when that Run has a recorded
-	// CodeEdge final-compliance result.
-	CodeEdgeComplianceRecordID       string `json:"codeedge_compliance_record_id,omitempty"`
-	CodeEdgeAuthorizationFingerprint string `json:"codeedge_authorization_fingerprint,omitempty"`
-	ReleaseID                        string `json:"release_id,omitempty"`
-	ReleaseRecordVersion             int64  `json:"release_record_version,omitempty"`
-	ReviewRequestID                  string `json:"review_request_id,omitempty"`
-	ReviewRevisionID                 string `json:"review_revision_id,omitempty"`
-	ReviewState                      string `json:"review_state,omitempty"`
-	ReviewEvidenceDigest             string `json:"review_evidence_digest,omitempty"`
+	ReleaseID            string `json:"release_id,omitempty"`
+	ReleaseRecordVersion int64  `json:"release_record_version,omitempty"`
+	ReviewRequestID      string `json:"review_request_id,omitempty"`
+	ReviewRevisionID     string `json:"review_revision_id,omitempty"`
+	ReviewState          string `json:"review_state,omitempty"`
+	ReviewEvidenceDigest string `json:"review_evidence_digest,omitempty"`
 }
 
 // LifecycleMutationCommandBase holds common operator provenance and the
@@ -117,46 +102,9 @@ type StartRunLifecycleCommand struct {
 	LifecycleMutationCommandBase
 	ProfilePath       string `json:"profile_path"`
 	ExecutionSpecPath string `json:"execution_spec_path"`
-	// ParentRunID is optional for the generic run-start surface. The strict
-	// evaluator launch service always requires and freezes it.
+	// ParentRunID is optional for the generic run-start surface.
 	ParentRunID string `json:"parent_run_id,omitempty"`
 	Trigger     string `json:"trigger"`
-}
-
-// CodeEdgeEvaluatorLaunchCommand intentionally contains no profile, spec,
-// provider, model, endpoint, secret, or argv fields. Those facts are owned by
-// the catalog/lock-attested definition provider installed at composition time.
-type CodeEdgeEvaluatorLaunchCommand struct {
-	LifecycleMutationCommandBase
-	ParentRunID string `json:"parent_run_id"`
-}
-
-// CodeEdgeEvaluatorEvidenceHandoffCommand deliberately accepts only the two
-// durable Run identities. The application service rebuilds and verifies every
-// receipt, trial, artifact, catalog, and manifest fact itself; callers cannot
-// smuggle a handoff document or any evidence bytes across this boundary.
-type CodeEdgeEvaluatorEvidenceHandoffCommand struct {
-	LifecycleMutationCommandBase
-	ParentRunID string `json:"parent_run_id"`
-	ChildRunID  string `json:"child_run_id"`
-}
-
-// PreparedCodeEdgeEvaluatorEvidenceHandoff is the durable first-confirmation
-// receipt for an evidence adoption. Confirming it later consumes precisely the
-// captured parent checkpoint and child identity; a direct confirm is rejected.
-type PreparedCodeEdgeEvaluatorEvidenceHandoff struct {
-	OperationID          string
-	ParentRunID          string
-	ChildRunID           string
-	HandoffFingerprint   workflowkit.Fingerprint
-	QwenTrialFingerprint workflowkit.Fingerprint
-	OpusTrialFingerprint workflowkit.Fingerprint
-}
-
-type codeEdgeEvaluatorEvidenceHandoffPayload struct {
-	Format      string `json:"format"`
-	ParentRunID string `json:"parent_run_id"`
-	ChildRunID  string `json:"child_run_id"`
 }
 
 type PackageLifecycleCommand struct {
@@ -195,21 +143,19 @@ type LifecycleMutationReceipt struct {
 	// Standard pre-materialization launch. They make the source/session subject
 	// observable without pretending that the revision-free draft Task is a
 	// TaskRevision.
-	AuthoringSourceID                   string `json:"authoring_source_id,omitempty"`
-	AuthoringSessionID                  string `json:"authoring_session_id,omitempty"`
-	SourceSnapshotDigest                string `json:"source_snapshot_digest,omitempty"`
-	EvaluatorEvidenceHandoffID          string `json:"evaluator_evidence_handoff_id,omitempty"`
-	EvaluatorEvidenceHandoffFingerprint string `json:"evaluator_evidence_handoff_fingerprint,omitempty"`
-	ReleaseID                           string `json:"release_id,omitempty"`
-	ReleaseVersion                      string `json:"release_version,omitempty"`
-	DeletionRecordID                    string `json:"deletion_record_id,omitempty"`
-	ReviewRequestID                     string `json:"review_request_id,omitempty"`
-	ReviewDecisionID                    string `json:"review_decision_id,omitempty"`
-	ReviewDecision                      string `json:"review_decision,omitempty"`
-	PlanID                              string `json:"plan_id,omitempty"`
-	ExecutionID                         string `json:"execution_id,omitempty"`
-	CandidateID                         string `json:"candidate_id,omitempty"`
-	Summary                             string `json:"summary"`
+	AuthoringSourceID    string `json:"authoring_source_id,omitempty"`
+	AuthoringSessionID   string `json:"authoring_session_id,omitempty"`
+	SourceSnapshotDigest string `json:"source_snapshot_digest,omitempty"`
+	ReleaseID            string `json:"release_id,omitempty"`
+	ReleaseVersion       string `json:"release_version,omitempty"`
+	DeletionRecordID     string `json:"deletion_record_id,omitempty"`
+	ReviewRequestID      string `json:"review_request_id,omitempty"`
+	ReviewDecisionID     string `json:"review_decision_id,omitempty"`
+	ReviewDecision       string `json:"review_decision,omitempty"`
+	PlanID               string `json:"plan_id,omitempty"`
+	ExecutionID          string `json:"execution_id,omitempty"`
+	CandidateID          string `json:"candidate_id,omitempty"`
+	Summary              string `json:"summary"`
 }
 
 // LifecycleMutationService is the typed application boundary for Task Hub
@@ -284,14 +230,6 @@ func (service *LifecycleMutationService) captureCheckpoint(ctx context.Context, 
 			return LifecycleMutationCheckpoint{}, fmt.Errorf("%w: run %s", ErrLifecycleNotFound, runID)
 		}
 		checkpoint.RunID, checkpoint.RunVersion, checkpoint.RunExecutionEpoch, checkpoint.RunDefinitionHash = run.ID, run.Version, run.ExecutionEpoch, run.DefinitionHash
-		compliance, complianceErr := service.core.store.GetCodeEdgeComplianceRecordForRun(ctx, run.ID)
-		if complianceErr != nil {
-			return LifecycleMutationCheckpoint{}, complianceErr
-		}
-		if compliance != nil {
-			checkpoint.CodeEdgeComplianceRecordID = compliance.ID
-			checkpoint.CodeEdgeAuthorizationFingerprint = compliance.AuthorizationFingerprint
-		}
 		if taskID == "" {
 			taskID = run.TaskID
 		}
@@ -559,116 +497,6 @@ func (service *LifecycleMutationService) StartRun(ctx context.Context, command S
 	return service.complete(ctx, op, receiptForRun(LifecycleMutationStartRun, run))
 }
 
-// PrepareCodeEdgeEvaluatorEvidenceHandoff writes the first-confirmation
-// lifecycle receipt only after read-only verification of the closed
-// parent/child evidence graph. It deliberately creates no handoff and no
-// provider side effect.
-func (service *LifecycleMutationService) PrepareCodeEdgeEvaluatorEvidenceHandoff(ctx context.Context, command CodeEdgeEvaluatorEvidenceHandoffCommand) (PreparedCodeEdgeEvaluatorEvidenceHandoff, error) {
-	if service == nil || service.core == nil || service.core.store == nil {
-		return PreparedCodeEdgeEvaluatorEvidenceHandoff{}, fmt.Errorf("lifecycle mutation service is not configured")
-	}
-	if err := validateCodeEdgeEvaluatorEvidenceHandoffCommand(command); err != nil {
-		return PreparedCodeEdgeEvaluatorEvidenceHandoff{}, err
-	}
-	plan, err := (&CodeEdgeEvaluatorEvidenceHandoffService{core: service.core}).Plan(ctx, command.ParentRunID, command.ChildRunID)
-	if err != nil {
-		return PreparedCodeEdgeEvaluatorEvidenceHandoff{}, err
-	}
-	op, replay, err := service.begin(ctx, LifecycleMutationCodeEdgeEvaluatorEvidenceHandoff, command.LifecycleMutationCommandBase, codeEdgeEvaluatorEvidenceHandoffPayload{
-		Format: "harbor.codeedge-evaluator-evidence-handoff.prepare.v1", ParentRunID: strings.TrimSpace(command.ParentRunID), ChildRunID: strings.TrimSpace(command.ChildRunID),
-	}, lifecycleOperationTargets{TaskID: command.Expected.TaskID, RevisionID: command.Expected.RevisionID, RunID: command.ParentRunID})
-	if err != nil {
-		return PreparedCodeEdgeEvaluatorEvidenceHandoff{}, err
-	}
-	if replay != nil {
-		return PreparedCodeEdgeEvaluatorEvidenceHandoff{}, fmt.Errorf("completed CodeEdge evaluator evidence handoff cannot be prepared again")
-	}
-	if err := service.validateCheckpoint(ctx, command.Expected); err != nil {
-		return PreparedCodeEdgeEvaluatorEvidenceHandoff{}, err
-	}
-	return PreparedCodeEdgeEvaluatorEvidenceHandoff{
-		OperationID:          op.ID,
-		ParentRunID:          plan.ParentRunID,
-		ChildRunID:           plan.ChildRunID,
-		HandoffFingerprint:   plan.HandoffFingerprint,
-		QwenTrialFingerprint: plan.QwenTrialFingerprint,
-		OpusTrialFingerprint: plan.OpusTrialFingerprint,
-	}, nil
-}
-
-// AdoptCodeEdgeEvaluatorEvidenceHandoff is the sole generic lifecycle-mutation
-// route for adopting a completed child evaluator Run. It is UUIDv7-idempotent
-// and keeps its durable operation separate from the handoff identity, so a
-// lost response can be replayed without manufacturing a second evidence
-// bridge. The child is never supplied as a caller-owned evidence payload.
-func (service *LifecycleMutationService) AdoptCodeEdgeEvaluatorEvidenceHandoff(ctx context.Context, command CodeEdgeEvaluatorEvidenceHandoffCommand) (LifecycleMutationReceipt, error) {
-	if service == nil || service.core == nil || service.core.store == nil {
-		return LifecycleMutationReceipt{}, fmt.Errorf("lifecycle mutation service is not configured")
-	}
-	if err := validateCodeEdgeEvaluatorEvidenceHandoffCommand(command); err != nil {
-		return LifecycleMutationReceipt{}, err
-	}
-	if receipt, replayed, err := service.completedOperationReplay(ctx, LifecycleMutationCodeEdgeEvaluatorEvidenceHandoff, command.LifecycleMutationCommandBase); err != nil {
-		return LifecycleMutationReceipt{}, err
-	} else if replayed {
-		return receipt, nil
-	}
-	prepared, err := service.core.store.GetLifecycleOperationByIdempotencyKey(ctx, command.IdempotencyKey)
-	if err != nil {
-		return LifecycleMutationReceipt{}, err
-	}
-	if prepared == nil || prepared.Action != string(LifecycleMutationCodeEdgeEvaluatorEvidenceHandoff) || prepared.State != store.LifecycleOperationPrepared {
-		return LifecycleMutationReceipt{}, fmt.Errorf("CodeEdge evaluator evidence handoff must be prepared before confirmation")
-	}
-	op, replay, err := service.begin(ctx, LifecycleMutationCodeEdgeEvaluatorEvidenceHandoff, command.LifecycleMutationCommandBase, codeEdgeEvaluatorEvidenceHandoffPayload{
-		Format: "harbor.codeedge-evaluator-evidence-handoff.prepare.v1", ParentRunID: strings.TrimSpace(command.ParentRunID), ChildRunID: strings.TrimSpace(command.ChildRunID),
-	}, lifecycleOperationTargets{TaskID: command.Expected.TaskID, RevisionID: command.Expected.RevisionID, RunID: command.ParentRunID})
-	if err != nil || replay != nil {
-		return lifecycleReplayResult(replay, err)
-	}
-	if err := service.validateCheckpoint(ctx, command.Expected); err != nil {
-		return LifecycleMutationReceipt{}, err
-	}
-	handoff, err := (&CodeEdgeEvaluatorEvidenceHandoffService{core: service.core}).Record(ctx, RecordCodeEdgeEvaluatorEvidenceHandoffRequest{
-		ID:             op.IdempotencyKey,
-		IdempotencyKey: op.IdempotencyKey,
-		ParentRunID:    command.ParentRunID,
-		ChildRunID:     command.ChildRunID,
-		Actor:          op.Actor,
-		Reason:         op.Reason,
-	})
-	if err != nil {
-		return LifecycleMutationReceipt{}, err
-	}
-	return service.complete(ctx, op, LifecycleMutationReceipt{
-		Action:                              LifecycleMutationCodeEdgeEvaluatorEvidenceHandoff,
-		TaskID:                              handoff.TaskID,
-		RevisionID:                          handoff.RevisionID,
-		RunID:                               handoff.ParentRunID,
-		ParentRunID:                         handoff.ParentRunID,
-		ChildRunID:                          handoff.ChildRunID,
-		EvaluatorEvidenceHandoffID:          handoff.ID,
-		EvaluatorEvidenceHandoffFingerprint: handoff.HandoffFingerprint,
-		Summary:                             "已采用并验证 CodeEdge evaluator child 证据",
-	})
-}
-
-func validateCodeEdgeEvaluatorEvidenceHandoffCommand(command CodeEdgeEvaluatorEvidenceHandoffCommand) error {
-	if err := store.ValidateUUIDv7(strings.TrimSpace(command.ParentRunID)); err != nil {
-		return fmt.Errorf("CodeEdge evaluator parent Run: %w", err)
-	}
-	if err := store.ValidateUUIDv7(strings.TrimSpace(command.ChildRunID)); err != nil {
-		return fmt.Errorf("CodeEdge evaluator child Run: %w", err)
-	}
-	if command.Expected.RunID != strings.TrimSpace(command.ParentRunID) || command.Expected.RunVersion <= 0 || command.Expected.RunDefinitionHash == "" {
-		return fmt.Errorf("CodeEdge evaluator evidence handoff requires the captured parent Run checkpoint")
-	}
-	if command.Expected.TaskID == "" || command.Expected.RevisionID == "" || command.Expected.RevisionDigest == "" {
-		return fmt.Errorf("CodeEdge evaluator evidence handoff requires the captured TaskRevision checkpoint")
-	}
-	return nil
-}
-
 func (service *LifecycleMutationService) Package(ctx context.Context, command PackageLifecycleCommand) (LifecycleMutationReceipt, error) {
 	if strings.TrimSpace(command.ReleaseVersion) == "" {
 		return LifecycleMutationReceipt{}, fmt.Errorf("local package release version is required")
@@ -686,9 +514,7 @@ func (service *LifecycleMutationService) Package(ctx context.Context, command Pa
 	}
 	result, err := (&ReleaseService{core: service.core}).PackageRevision(ctx, PackageRevisionRequest{
 		RevisionID: op.RevisionID, ExpectedStateVersion: command.Expected.RevisionStateVersion, ReleaseVersion: command.ReleaseVersion,
-		RunID: op.RunID, ExpectedComplianceRecordID: command.Expected.CodeEdgeComplianceRecordID,
-		ExpectedAuthorizationFingerprint: command.Expected.CodeEdgeAuthorizationFingerprint,
-		IdempotencyKey:                   op.IdempotencyKey, Actor: op.Actor, Reason: op.Reason,
+		IdempotencyKey: op.IdempotencyKey, Actor: op.Actor, Reason: op.Reason,
 	})
 	if err != nil {
 		return LifecycleMutationReceipt{}, err
@@ -932,9 +758,7 @@ func (service *LifecycleMutationService) begin(ctx context.Context, action Lifec
 		ExpectedTaskVersion: base.Expected.TaskVersion, ExpectedRevisionStateVersion: base.Expected.RevisionStateVersion, ExpectedRevisionDigest: base.Expected.RevisionDigest,
 		ExpectedRunVersion: base.Expected.RunVersion, ExpectedRunExecutionEpoch: base.Expected.RunExecutionEpoch, ExpectedRunDefinitionHash: base.Expected.RunDefinitionHash,
 		ExpectedReleaseRecordVersion: base.Expected.ReleaseRecordVersion, ExpectedReviewRevisionID: base.Expected.ReviewRevisionID, ExpectedReviewState: base.Expected.ReviewState, ExpectedReviewEvidenceDigest: base.Expected.ReviewEvidenceDigest,
-		ExpectedCodeEdgeComplianceRecordID:       base.Expected.CodeEdgeComplianceRecordID,
-		ExpectedCodeEdgeAuthorizationFingerprint: base.Expected.CodeEdgeAuthorizationFingerprint,
-		ReviewRequestID:                          base.Expected.ReviewRequestID, Actor: base.Actor, Reason: base.Reason,
+		ReviewRequestID: base.Expected.ReviewRequestID, Actor: base.Actor, Reason: base.Reason,
 	})
 	if err != nil {
 		return store.LifecycleOperation{}, nil, err
@@ -982,23 +806,21 @@ func (service *LifecycleMutationService) completedOperationReplay(ctx context.Co
 
 func lifecycleCheckpointForOperation(operation store.LifecycleOperation) LifecycleMutationCheckpoint {
 	return LifecycleMutationCheckpoint{
-		TaskID:                           operation.ExpectedTaskID,
-		TaskVersion:                      operation.ExpectedTaskVersion,
-		RevisionID:                       operation.ExpectedRevisionID,
-		RevisionStateVersion:             operation.ExpectedRevisionStateVersion,
-		RevisionDigest:                   operation.ExpectedRevisionDigest,
-		RunID:                            operation.ExpectedRunID,
-		RunVersion:                       operation.ExpectedRunVersion,
-		RunExecutionEpoch:                operation.ExpectedRunExecutionEpoch,
-		RunDefinitionHash:                operation.ExpectedRunDefinitionHash,
-		CodeEdgeComplianceRecordID:       operation.ExpectedCodeEdgeComplianceRecordID,
-		CodeEdgeAuthorizationFingerprint: operation.ExpectedCodeEdgeAuthorizationFingerprint,
-		ReleaseID:                        operation.ExpectedReleaseID,
-		ReleaseRecordVersion:             operation.ExpectedReleaseRecordVersion,
-		ReviewRequestID:                  operation.ExpectedReviewRequestID,
-		ReviewRevisionID:                 operation.ExpectedReviewRevisionID,
-		ReviewState:                      operation.ExpectedReviewState,
-		ReviewEvidenceDigest:             operation.ExpectedReviewEvidenceDigest,
+		TaskID:               operation.ExpectedTaskID,
+		TaskVersion:          operation.ExpectedTaskVersion,
+		RevisionID:           operation.ExpectedRevisionID,
+		RevisionStateVersion: operation.ExpectedRevisionStateVersion,
+		RevisionDigest:       operation.ExpectedRevisionDigest,
+		RunID:                operation.ExpectedRunID,
+		RunVersion:           operation.ExpectedRunVersion,
+		RunExecutionEpoch:    operation.ExpectedRunExecutionEpoch,
+		RunDefinitionHash:    operation.ExpectedRunDefinitionHash,
+		ReleaseID:            operation.ExpectedReleaseID,
+		ReleaseRecordVersion: operation.ExpectedReleaseRecordVersion,
+		ReviewRequestID:      operation.ExpectedReviewRequestID,
+		ReviewRevisionID:     operation.ExpectedReviewRevisionID,
+		ReviewState:          operation.ExpectedReviewState,
+		ReviewEvidenceDigest: operation.ExpectedReviewEvidenceDigest,
 	}
 }
 
@@ -1072,7 +894,6 @@ func (service *LifecycleMutationService) validateCheckpoint(ctx context.Context,
 	if current.TaskID != expected.TaskID || current.TaskVersion != expected.TaskVersion ||
 		current.RevisionID != expected.RevisionID || current.RevisionStateVersion != expected.RevisionStateVersion || current.RevisionDigest != expected.RevisionDigest ||
 		current.RunID != expected.RunID || current.RunVersion != expected.RunVersion || current.RunExecutionEpoch != expected.RunExecutionEpoch || current.RunDefinitionHash != expected.RunDefinitionHash ||
-		current.CodeEdgeComplianceRecordID != expected.CodeEdgeComplianceRecordID || current.CodeEdgeAuthorizationFingerprint != expected.CodeEdgeAuthorizationFingerprint ||
 		current.ReleaseID != expected.ReleaseID || current.ReleaseRecordVersion != expected.ReleaseRecordVersion ||
 		current.ReviewRequestID != expected.ReviewRequestID || current.ReviewRevisionID != expected.ReviewRevisionID || current.ReviewState != expected.ReviewState || current.ReviewEvidenceDigest != expected.ReviewEvidenceDigest {
 		return fmt.Errorf("%w: lifecycle mutation checkpoint is stale", store.ErrOptimisticLock)
@@ -1191,7 +1012,7 @@ func lifecycleReplayResult(replay *LifecycleMutationReceipt, err error) (Lifecyc
 
 func (checkpoint LifecycleMutationCheckpoint) empty() bool {
 	return checkpoint.TaskID == "" && checkpoint.TaskVersion == 0 && checkpoint.RevisionID == "" && checkpoint.RevisionStateVersion == 0 && checkpoint.RevisionDigest == "" &&
-		checkpoint.RunID == "" && checkpoint.RunVersion == 0 && checkpoint.RunExecutionEpoch == 0 && checkpoint.RunDefinitionHash == "" && checkpoint.CodeEdgeComplianceRecordID == "" && checkpoint.CodeEdgeAuthorizationFingerprint == "" &&
+		checkpoint.RunID == "" && checkpoint.RunVersion == 0 && checkpoint.RunExecutionEpoch == 0 && checkpoint.RunDefinitionHash == "" &&
 		checkpoint.ReleaseID == "" && checkpoint.ReleaseRecordVersion == 0 && checkpoint.ReviewRequestID == "" && checkpoint.ReviewRevisionID == "" && checkpoint.ReviewState == "" && checkpoint.ReviewEvidenceDigest == ""
 }
 

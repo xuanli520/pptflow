@@ -11,7 +11,6 @@ import (
 	"unicode"
 
 	"github.com/google/uuid"
-	"github.com/purplevoid/harbor-factory/internal/harbor/codeedge"
 	"github.com/purplevoid/harbor-factory/pkg/workflowkit"
 )
 
@@ -400,11 +399,6 @@ const (
 	StageBindingQualityCheck             StageBindingType = "quality_check"
 	StageBindingSimilarityCheck          StageBindingType = "similarity_check"
 	StageBindingFinalReview              StageBindingType = "final_review"
-	StageBindingHarborRunQwen            StageBindingType = "harbor_run_qwen"
-	StageBindingHarborRunOpus            StageBindingType = "harbor_run_opus"
-	StageBindingEvaluatorEvidenceHandoff StageBindingType = "evaluator_evidence_handoff"
-	StageBindingResultReview             StageBindingType = "result_review"
-	StageBindingSubmissionLint           StageBindingType = "submission_lint"
 	StageBindingPackage                  StageBindingType = "package"
 )
 
@@ -449,13 +443,12 @@ func (UniversalStageBinding) stageExecutionBinding() {}
 // ExecutionProfile: profile carries budget policy while this document carries
 // the immutable runtime inputs selected for one Run.
 type RunExecutionSpec struct {
-	Format                        string                          `json:"format"`
-	Version                       string                          `json:"version"`
-	Template                      TemplateReference               `json:"template"`
-	Selection                     RunSelectionReference           `json:"selection"`
-	References                    ExecutionReferenceSet           `json:"references"`
-	Stages                        []StageExecutionBinding         `json:"stages"`
-	CodeEdgeFinalCompliancePolicy *codeedge.FinalCompliancePolicy `json:"codeedge_final_compliance_policy,omitempty"`
+	Format     string                  `json:"format"`
+	Version    string                  `json:"version"`
+	Template   TemplateReference       `json:"template"`
+	Selection  RunSelectionReference   `json:"selection"`
+	References ExecutionReferenceSet   `json:"references"`
+	Stages     []StageExecutionBinding `json:"stages"`
 }
 
 // StageOperationResolution is the complete immutable selection that a
@@ -502,10 +495,6 @@ type StageOperationResolver interface {
 // Clone returns a deep copy. Concrete stage binding types are preserved.
 func (spec RunExecutionSpec) Clone() RunExecutionSpec {
 	spec.References = spec.References.Clone()
-	if spec.CodeEdgeFinalCompliancePolicy != nil {
-		policy := spec.CodeEdgeFinalCompliancePolicy.Clone()
-		spec.CodeEdgeFinalCompliancePolicy = &policy
-	}
 	stages := spec.Stages
 	spec.Stages = make([]StageExecutionBinding, len(stages))
 	for index, binding := range stages {
@@ -769,9 +758,6 @@ func (spec RunExecutionSpec) ValidateFor(catalog StageCatalog) error {
 			return fmt.Errorf("%w: missing stage binding %q", errInvalidExecutionSpec, definition.Key)
 		}
 	}
-	if err := spec.validateCodeEdgeEvaluatorChildBindings(); err != nil {
-		return err
-	}
 	if err := index.validateAllUsed(); err != nil {
 		return err
 	}
@@ -779,8 +765,7 @@ func (spec RunExecutionSpec) ValidateFor(catalog StageCatalog) error {
 }
 
 // validateTemplateExtension keeps deployment-specific policy out of generic
-// executions while requiring CodeEdge Phase-1 to freeze every final-compliance
-// decision input with its Run.
+// executions.
 func (spec RunExecutionSpec) validateTemplateExtension() error {
 	selectionKind, err := spec.Selection.resolvedKind()
 	if err != nil {
@@ -792,18 +777,6 @@ func (spec RunExecutionSpec) validateTemplateExtension() error {
 		}
 	} else if selectionKind == RunSelectionAuthoringSession {
 		return fmt.Errorf("%w: authoring-session selection is only accepted by Standard authoring template versions registered in this binary", errInvalidExecutionSpec)
-	}
-	if spec.Template.Equal(CodeEdgePhase1TemplateReference()) {
-		if spec.CodeEdgeFinalCompliancePolicy == nil {
-			return fmt.Errorf("%w: CodeEdge Phase-1 execution specification requires a final compliance policy", errInvalidExecutionSpec)
-		}
-		if err := spec.CodeEdgeFinalCompliancePolicy.Validate(); err != nil {
-			return fmt.Errorf("%w: CodeEdge Phase-1 final compliance policy: %v", errInvalidExecutionSpec, err)
-		}
-		return nil
-	}
-	if spec.CodeEdgeFinalCompliancePolicy != nil {
-		return fmt.Errorf("%w: CodeEdge Phase-1 final compliance policy is not accepted by template %s@%s", errInvalidExecutionSpec, spec.Template.ID, spec.Template.Version)
 	}
 	return nil
 }
@@ -849,11 +822,6 @@ func ParseRunExecutionSpecJSON(raw []byte) (RunExecutionSpec, error) {
 		Format: document.Format, Version: document.Version, Template: document.Template, Selection: document.Selection,
 		References: document.References, Stages: make([]StageExecutionBinding, 0, len(document.Stages)),
 	}
-	policy, err := parseCodeEdgeFinalCompliancePolicy(document.CodeEdgeFinalCompliancePolicy)
-	if err != nil {
-		return RunExecutionSpec{}, fmt.Errorf("decode CodeEdge final compliance policy: %w", err)
-	}
-	spec.CodeEdgeFinalCompliancePolicy = policy
 	for index, rawBinding := range document.Stages {
 		binding, err := parseStageExecutionBinding(rawBinding)
 		if err != nil {
@@ -868,27 +836,12 @@ func ParseRunExecutionSpecJSON(raw []byte) (RunExecutionSpec, error) {
 }
 
 type runExecutionSpecDocument struct {
-	Format                        string                `json:"format"`
-	Version                       string                `json:"version"`
-	Template                      TemplateReference     `json:"template"`
-	Selection                     RunSelectionReference `json:"selection"`
-	References                    ExecutionReferenceSet `json:"references"`
-	Stages                        []json.RawMessage     `json:"stages"`
-	CodeEdgeFinalCompliancePolicy json.RawMessage       `json:"codeedge_final_compliance_policy"`
-}
-
-func parseCodeEdgeFinalCompliancePolicy(raw json.RawMessage) (*codeedge.FinalCompliancePolicy, error) {
-	if len(raw) == 0 {
-		return nil, nil
-	}
-	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-		return nil, errors.New("final compliance policy must be an object, not null")
-	}
-	var policy codeedge.FinalCompliancePolicy
-	if err := decodeExecutionSpecJSON(raw, &policy); err != nil {
-		return nil, err
-	}
-	return &policy, nil
+	Format     string                `json:"format"`
+	Version    string                `json:"version"`
+	Template   TemplateReference     `json:"template"`
+	Selection  RunSelectionReference `json:"selection"`
+	References ExecutionReferenceSet `json:"references"`
+	Stages     []json.RawMessage     `json:"stages"`
 }
 
 type stageBindingDiscriminator struct {
@@ -957,11 +910,6 @@ var knownStageBindingTypes = map[StageBindingType]bool{
 	StageBindingQualityCheck:             true,
 	StageBindingSimilarityCheck:          true,
 	StageBindingFinalReview:              true,
-	StageBindingHarborRunQwen:            true,
-	StageBindingHarborRunOpus:            true,
-	StageBindingEvaluatorEvidenceHandoff: true,
-	StageBindingResultReview:             true,
-	StageBindingSubmissionLint:           true,
 	StageBindingPackage:                  true,
 }
 
@@ -1163,12 +1111,6 @@ func (spec *RunExecutionSpec) normalize() {
 	selection, err := spec.Selection.Canonical()
 	if err == nil {
 		spec.Selection = selection
-	}
-	if spec.CodeEdgeFinalCompliancePolicy != nil {
-		policy := spec.CodeEdgeFinalCompliancePolicy.Clone()
-		sort.Strings(policy.QwenPolicy.InfraExceptionTypes)
-		sort.Strings(policy.OpusPolicy.InfraExceptionTypes)
-		spec.CodeEdgeFinalCompliancePolicy = &policy
 	}
 	sort.Slice(spec.References.Artifacts, func(left, right int) bool {
 		return spec.References.Artifacts[left].ID < spec.References.Artifacts[right].ID

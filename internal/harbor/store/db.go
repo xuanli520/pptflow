@@ -31,21 +31,6 @@ const (
 	// database whose tables, constraints, indexes, or triggers have drifted.
 	baselineV2SchemaContractMetadataKey = "schema_contract_fingerprint"
 	baselineV2SchemaContractDomain      = "harbor.store.consolidated-v2-schema-contract.v1"
-
-	// These are the previously published consolidated V2 schemas whose Standard
-	// authoring handoff trigger predates one or more currently accepted template
-	// versions.
-	// They are admitted only for the atomic upgrade below; unknown fingerprints
-	// remain rejected.
-	legacyV12ConsolidatedV2SchemaContractFingerprint = "sha256:db935bd40f92f0d7a9ae4d432b568f5987aebe4d41a5d66f90c55d3fafc53f0b"
-	legacyV13ConsolidatedV2SchemaContractFingerprint = "sha256:dcb8391fa99e349def515fbeec9e4b193f4b1875898a9c61806230a767e5f2bc"
-	legacyV14ConsolidatedV2SchemaContractFingerprint = "sha256:5d795149bc1950bacf0bb8b4d284902f677ec8a9a5f48a8a967ac3b0209306af"
-	legacyV15ConsolidatedV2SchemaContractFingerprint = "sha256:606157ed9098dc3c5e5006599f560cc01200a053ec5dae8f32e0ec40ebc33a7f"
-	legacyV16ConsolidatedV2SchemaContractFingerprint = "sha256:2bafc3dec0fae16478ad404afb0a1c25bf419267d977faaebe63afbe08a0beb6"
-	legacyV17ConsolidatedV2SchemaContractFingerprint = "sha256:8fd4320d04b231bd700596d85827d0a9cdd787cd346bcf0cf5c9c79642283162"
-	legacyV18ConsolidatedV2SchemaContractFingerprint = "sha256:db5f4c05610a9905b43e981f1955d7c007867f508e6422fb762d7f847d744571"
-	authoringPhase1HandoffTriggerName                = "authoring_phase1_handoffs_v2_binding_insert"
-	codeEdgeEvaluatorParentIndexName                 = "idx_workflow_runs_codeedge_evaluator_parent"
 )
 
 type sqliteSchemaContractObject struct {
@@ -331,22 +316,11 @@ func preflightWritableStoreAdmission(dbPath string) error {
 		return preConsolidationStoreError("database has tables but no V2 baseline marker")
 	}
 
-	if err := validateConsolidatedV2BaselineDatabase(db, true); err != nil {
+	if err := validateConsolidatedV2BaselineDatabase(db); err != nil {
 		if errors.Is(err, ErrPreConsolidationStore) {
 			return err
 		}
 		return nil
-	}
-	needsUpgrade, err := legacyConsolidatedV2SchemaUpgradeRequired(db)
-	if err != nil {
-		return fmt.Errorf("inspect legacy schema upgrade state: %w", err)
-	}
-	if needsUpgrade {
-		if runID, status, blocked, err := unfinishedLegacySchemaUpgradeRun(db); err != nil {
-			return fmt.Errorf("inspect unfinished workflow Runs before schema upgrade: %w", err)
-		} else if blocked {
-			return activeRunSchemaUpgradeError(runID, status)
-		}
 	}
 
 	// A current baseline that cannot pass a physical integrity scan is not
@@ -493,13 +467,7 @@ func (s *Store) migrate() error {
 		}
 		return s.bootstrapV2()
 	}
-	if err := validateConsolidatedV2BaselineDatabase(s.db, true); err != nil {
-		return err
-	}
-	if err := s.upgradeLegacyConsolidatedV2Schema(); err != nil {
-		return err
-	}
-	return validateConsolidatedV2BaselineDatabase(s.db, false)
+	return validateConsolidatedV2BaselineDatabase(s.db)
 }
 
 // rejectLegacyV1Store recognizes only schema markers. It never reads V1 rows,
@@ -598,14 +566,14 @@ func (s *Store) hasUserTables() (bool, error) {
 // was the first step of the retired incremental chain and has a different
 // physical schema. This check is deliberately read-only.
 func (s *Store) validateConsolidatedV2Baseline() error {
-	return validateConsolidatedV2BaselineDatabase(s.db, false)
+	return validateConsolidatedV2BaselineDatabase(s.db)
 }
 
 // validateConsolidatedV2BaselineDatabase is the shared read-only admission
 // check for a control-plane SQLite database. It is used for normal store opens
 // and recovery candidates so a backup cannot restore a database that this
 // binary would immediately reject.
-func validateConsolidatedV2BaselineDatabase(db *sql.DB, allowKnownLegacy bool) error {
+func validateConsolidatedV2BaselineDatabase(db *sql.DB) error {
 	hasTable, err := hasSchemaVersionTableDatabase(db)
 	if err != nil {
 		return err
@@ -661,9 +629,6 @@ func validateConsolidatedV2BaselineDatabase(db *sql.DB, allowKnownLegacy bool) e
 	if recordedContract == expectedContract && actualContract == expectedContract {
 		return nil
 	}
-	if allowKnownLegacy && recordedContract == actualContract && isKnownLegacyConsolidatedV2SchemaContract(recordedContract) {
-		return nil
-	}
 	if recordedContract != expectedContract {
 		return preConsolidationStoreError("V2 schema contract marker does not match this control plane")
 	}
@@ -671,229 +636,6 @@ func validateConsolidatedV2BaselineDatabase(db *sql.DB, allowKnownLegacy bool) e
 		return preConsolidationStoreError("V2 physical schema does not match the consolidated baseline")
 	}
 	return nil
-}
-
-// upgradeLegacyConsolidatedV2Schema repairs published V2 contracts that
-// predate the current Standard authoring handoff or evaluator-child uniqueness
-// boundary. The DDL replacement and contract marker update are one transaction,
-// so an interrupted startup leaves the old, internally consistent schema for
-// the next attempt. No unknown schema is admitted here.
-func (s *Store) upgradeLegacyConsolidatedV2Schema() error {
-	needsUpgrade, err := legacyConsolidatedV2SchemaUpgradeRequired(s.db)
-	if err != nil {
-		return fmt.Errorf("inspect legacy schema upgrade state: %w", err)
-	}
-	if !needsUpgrade {
-		return nil
-	}
-	return s.applyLegacyConsolidatedV2SchemaUpgrade()
-}
-
-func legacyConsolidatedV2SchemaUpgradeRequired(db *sql.DB) (bool, error) {
-	var recordedContract string
-	if err := db.QueryRow(`SELECT value FROM store_metadata WHERE key = ?`, baselineV2SchemaContractMetadataKey).Scan(&recordedContract); err != nil {
-		return false, err
-	}
-	actualContract, err := sqliteSchemaContract(db)
-	if err != nil {
-		return false, fmt.Errorf("derive persisted legacy V2 schema contract: %w", err)
-	}
-	return recordedContract == actualContract && isKnownLegacyConsolidatedV2SchemaContract(recordedContract), nil
-}
-
-func unfinishedLegacySchemaUpgradeRun(db *sql.DB) (string, WorkflowRunStatus, bool, error) {
-	var activeRunID string
-	var activeRunStatus WorkflowRunStatus
-	err := db.QueryRow(`
-		SELECT id, status
-		FROM workflow_runs
-		WHERE status NOT IN (?, ?, ?, ?)
-		ORDER BY created_at, id
-		LIMIT 1
-	`, WorkflowRunSucceeded, WorkflowRunFailedTerminal, WorkflowRunCanceled, WorkflowRunInterrupted).Scan(&activeRunID, &activeRunStatus)
-	if err == nil {
-		return activeRunID, activeRunStatus, true, nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return "", "", false, err
-	}
-	return "", "", false, nil
-}
-
-func activeRunSchemaUpgradeError(runID string, status WorkflowRunStatus) error {
-	return fmt.Errorf("%w: run %s is %s; finish it with the deployment package that froze its execution contract or initialize a new root", ErrActiveRunSchemaUpgrade, runID, status)
-}
-
-func (s *Store) applyLegacyConsolidatedV2SchemaUpgrade() error {
-	triggerSQL, err := currentAuthoringPhase1HandoffTriggerSQL()
-	if err != nil {
-		return err
-	}
-	agentTurnTranscriptSQL, err := currentAgentTurnTranscriptSchemaSQL()
-	if err != nil {
-		return err
-	}
-	expectedContract, err := consolidatedV2SchemaContract()
-	if err != nil {
-		return fmt.Errorf("derive upgraded V2 schema contract: %w", err)
-	}
-	tx, err := s.db.BeginTx(context.Background(), nil)
-	if err != nil {
-		return fmt.Errorf("begin legacy V2 schema upgrade: %w", err)
-	}
-	defer tx.Rollback()
-	var recordedContract string
-	if err := tx.QueryRowContext(context.Background(), `SELECT value FROM store_metadata WHERE key = ?`, baselineV2SchemaContractMetadataKey).Scan(&recordedContract); err != nil {
-		return fmt.Errorf("read legacy V2 schema contract marker in upgrade transaction: %w", err)
-	}
-	if !isKnownLegacyConsolidatedV2SchemaContract(recordedContract) {
-		// Another writer completed the upgrade after the preflight but before
-		// this BEGIN IMMEDIATE transaction acquired its reservation.
-		return nil
-	}
-	runID, status, blocked, err := unfinishedLegacySchemaUpgradeRunTx(context.Background(), tx)
-	if err != nil {
-		return fmt.Errorf("inspect unfinished workflow Runs in schema upgrade transaction: %w", err)
-	}
-	if blocked {
-		return activeRunSchemaUpgradeError(runID, status)
-	}
-	if _, err := tx.Exec(`DROP TRIGGER IF EXISTS ` + authoringPhase1HandoffTriggerName); err != nil {
-		return fmt.Errorf("drop legacy Standard authoring handoff trigger: %w", err)
-	}
-	if _, err := tx.Exec(triggerSQL); err != nil {
-		return fmt.Errorf("install upgraded Standard authoring handoff trigger: %w", err)
-	}
-	if _, err := tx.Exec(agentTurnTranscriptSQL); err != nil {
-		return fmt.Errorf("install agent turn transcript schema: %w", err)
-	}
-	var duplicateParentRunID string
-	err = tx.QueryRowContext(context.Background(), `
-		SELECT parent_run_id
-		FROM workflow_runs
-		WHERE parent_run_id IS NOT NULL
-		  AND workflow_template_id = 'harbor.codeedge-evaluator'
-		GROUP BY parent_run_id
-		HAVING COUNT(*) > 1
-		ORDER BY parent_run_id
-		LIMIT 1
-	`).Scan(&duplicateParentRunID)
-	if err == nil {
-		return fmt.Errorf("cannot upgrade V2 schema: Phase-1 parent %s has multiple CodeEdge evaluator child Runs", duplicateParentRunID)
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("check legacy CodeEdge evaluator child uniqueness: %w", err)
-	}
-	indexSQL, err := currentCodeEdgeEvaluatorParentIndexSQL()
-	if err != nil {
-		return err
-	}
-	if _, err := tx.Exec(indexSQL); err != nil {
-		return fmt.Errorf("install CodeEdge evaluator child uniqueness index: %w", err)
-	}
-	if _, err := tx.Exec(`UPDATE store_metadata SET value = ?, updated_at = ? WHERE key = ?`, expectedContract, s.now().UTC(), baselineV2SchemaContractMetadataKey); err != nil {
-		return fmt.Errorf("record upgraded V2 schema contract: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit legacy V2 schema upgrade: %w", err)
-	}
-	return nil
-}
-
-func unfinishedLegacySchemaUpgradeRunTx(ctx context.Context, tx *sql.Tx) (string, WorkflowRunStatus, bool, error) {
-	if tx == nil {
-		return "", "", false, fmt.Errorf("schema upgrade transaction is required")
-	}
-	var activeRunID string
-	var activeRunStatus WorkflowRunStatus
-	err := tx.QueryRowContext(ctx, `
-		SELECT id, status
-		FROM workflow_runs
-		WHERE status NOT IN (?, ?, ?, ?)
-		ORDER BY created_at, id
-		LIMIT 1
-	`, WorkflowRunSucceeded, WorkflowRunFailedTerminal, WorkflowRunCanceled, WorkflowRunInterrupted).Scan(&activeRunID, &activeRunStatus)
-	if err == nil {
-		return activeRunID, activeRunStatus, true, nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return "", "", false, err
-	}
-	return "", "", false, nil
-}
-
-func isKnownLegacyConsolidatedV2SchemaContract(fingerprint string) bool {
-	switch fingerprint {
-	case legacyV12ConsolidatedV2SchemaContractFingerprint, legacyV13ConsolidatedV2SchemaContractFingerprint,
-		legacyV14ConsolidatedV2SchemaContractFingerprint, legacyV15ConsolidatedV2SchemaContractFingerprint,
-		legacyV16ConsolidatedV2SchemaContractFingerprint, legacyV17ConsolidatedV2SchemaContractFingerprint,
-		legacyV18ConsolidatedV2SchemaContractFingerprint:
-		return true
-	default:
-		return false
-	}
-}
-
-func currentAuthoringPhase1HandoffTriggerSQL() (string, error) {
-	startMarker := "CREATE TRIGGER " + authoringPhase1HandoffTriggerName
-	start := strings.Index(migrationV2, startMarker)
-	if start < 0 {
-		return "", fmt.Errorf("current Standard authoring handoff trigger is missing from V2 migration")
-	}
-	endMarker := "\n\n-- trigger workflow_runs_content_immutable"
-	relativeEnd := strings.Index(migrationV2[start:], endMarker)
-	if relativeEnd < 0 {
-		return "", fmt.Errorf("current Standard authoring handoff trigger boundary is missing from V2 migration")
-	}
-	return strings.TrimSpace(migrationV2[start : start+relativeEnd]), nil
-}
-
-func currentCodeEdgeEvaluatorParentIndexSQL() (string, error) {
-	startMarker := "CREATE UNIQUE INDEX " + codeEdgeEvaluatorParentIndexName
-	start := strings.Index(migrationV2, startMarker)
-	if start < 0 {
-		return "", fmt.Errorf("current CodeEdge evaluator child uniqueness index is missing from V2 migration")
-	}
-	endMarker := "\n\n-- index idx_workflow_runs_status"
-	relativeEnd := strings.Index(migrationV2[start:], endMarker)
-	if relativeEnd < 0 {
-		return "", fmt.Errorf("current CodeEdge evaluator child uniqueness index boundary is missing from V2 migration")
-	}
-	return strings.TrimSpace(migrationV2[start : start+relativeEnd]), nil
-}
-
-// currentAgentTurnTranscriptSchemaSQL extracts every object that composes the
-// transcript retention boundary from the same frozen baseline used for fresh
-// control planes. Known legacy V2 roots receive these objects in the atomic
-// schema-contract upgrade, never through a second schema-version history.
-func currentAgentTurnTranscriptSchemaSQL() (string, error) {
-	sections := [][2]string{
-		{"-- table agent_turn_transcripts", "-- table outbox_delivery_operations_v9"},
-		{"-- index idx_agent_turn_transcripts_expiry", "-- index idx_turn_checkpoints_node"},
-		{"-- trigger agent_turn_transcripts_no_delete", "-- trigger audit_events_no_delete"},
-		{"-- trigger entity_id_registry_agent_turn_transcripts_id_immutable", "-- trigger entity_id_registry_budget_grants_id_immutable"},
-	}
-	result := make([]string, 0, len(sections))
-	for _, section := range sections {
-		value, err := migrationV2Section(section[0], section[1])
-		if err != nil {
-			return "", err
-		}
-		result = append(result, value)
-	}
-	return strings.Join(result, "\n\n"), nil
-}
-
-func migrationV2Section(startMarker, endMarker string) (string, error) {
-	start := strings.Index(migrationV2, startMarker)
-	if start < 0 {
-		return "", fmt.Errorf("V2 migration section %q is missing", startMarker)
-	}
-	relativeEnd := strings.Index(migrationV2[start:], endMarker)
-	if relativeEnd < 0 {
-		return "", fmt.Errorf("V2 migration section %q boundary is missing", startMarker)
-	}
-	return strings.TrimSpace(migrationV2[start : start+relativeEnd]), nil
 }
 
 // consolidatedV2SchemaContract derives the canonical DDL fingerprint from a
