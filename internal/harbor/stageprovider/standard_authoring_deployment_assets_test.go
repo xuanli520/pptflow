@@ -46,8 +46,8 @@ func TestStandardAuthoringV3DeploymentCatalogAndAssetsAreExactAndLoadable(t *tes
 	if !found {
 		t.Fatal("production execution profile omits authoring_repair budget")
 	}
-	if repairBudget.MaxTurns != 8 || repairBudget.TurnTimeout != 90*time.Minute || repairBudget.AttemptTimeout != 12*time.Hour+30*time.Minute || repairBudget.MaxElapsed != 12*time.Hour+30*time.Minute {
-		t.Fatalf("authoring_repair budget = %+v, want eight 90-minute turns with a 12h30m attempt window", repairBudget)
+	if repairBudget.MaxTurns != 8 || repairBudget.TurnTimeout != 3*time.Hour || repairBudget.AttemptTimeout != 25*time.Hour || repairBudget.MaxElapsed != 25*time.Hour {
+		t.Fatalf("authoring_repair budget = %+v, want eight 3-hour turns with a 25h attempt window", repairBudget)
 	}
 
 	manifestRaw, err := os.ReadFile(filepath.Join(deploymentRoot, "contract-assets.v1.json"))
