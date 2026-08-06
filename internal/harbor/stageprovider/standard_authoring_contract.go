@@ -3,7 +3,9 @@ package stageprovider
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"path"
+	"path/filepath"
 	"sort"
 	"strings"
 	"unicode"
@@ -395,12 +397,18 @@ type standardAuthoringContractAssetBinding struct {
 func validateStandardAuthoringLockContract(lock DeploymentOperationCatalogLock) error {
 	isStandardAuthoring := workflowadapter.IsStandardAuthoringWorkflowTemplate(lock.CatalogReceipt.Template)
 	if !isStandardAuthoring {
+		if len(lock.StandardAuthoringDockerCommands) != 0 {
+			return fmt.Errorf("%w: Standard authoring Docker commands are only valid for installed Standard authoring templates", ErrInvalidDeploymentOperationCatalogLock)
+		}
 		for index, record := range lock.Operations {
 			if record.StandardAuthoringContract != nil {
 				return fmt.Errorf("%w: operation %d carries a Standard authoring contract for non-Standard-authoring template", ErrInvalidDeploymentOperationCatalogLock, index)
 			}
 		}
 		return nil
+	}
+	if err := validateStandardAuthoringDockerCommandLocks(lock.StandardAuthoringDockerCommands); err != nil {
+		return err
 	}
 	if err := validateStandardAuthoringLockedTurnBudgets(lock); err != nil {
 		return err
@@ -432,6 +440,38 @@ func validateStandardAuthoringLockContract(lock DeploymentOperationCatalogLock) 
 			if err := recordStandardAuthoringContractAssetBinding(identities, paths, "schema", asset.StandardAuthoringContractAssetReference, asset.ContentSHA256); err != nil {
 				return err
 			}
+		}
+	}
+	return nil
+}
+
+// validateStandardAuthoringDockerCommandLocks proves a supplied command set
+// is either absent or exactly the three approved Docker-dependent harness
+// identities with complete absolute executable locks.
+func validateStandardAuthoringDockerCommandLocks(commands []LocalExecutableLock) error {
+	if len(commands) == 0 {
+		return nil
+	}
+	if len(commands) != 3 {
+		return fmt.Errorf("%w: Standard authoring Docker commands must be exactly three", ErrInvalidDeploymentOperationCatalogLock)
+	}
+	seen := make(map[string]struct{}, len(commands))
+	for _, command := range commands {
+		switch command.CommandID {
+		case StandardAuthoringDockerBuildCommandID, StandardAuthoringInitialVerifyCommandID, StandardAuthoringOracleVerifyCommandID:
+		default:
+			return fmt.Errorf("%w: Standard authoring Docker command %q is not approved", ErrInvalidDeploymentOperationCatalogLock, command.CommandID)
+		}
+		if _, duplicate := seen[command.CommandID]; duplicate {
+			return fmt.Errorf("%w: Standard authoring Docker command %q is duplicated", ErrInvalidDeploymentOperationCatalogLock, command.CommandID)
+		}
+		seen[command.CommandID] = struct{}{}
+		if strings.TrimSpace(command.Version) == "" || !filepath.IsAbs(command.AbsolutePath) ||
+			filepath.Clean(command.AbsolutePath) != command.AbsolutePath || command.AbsolutePath == string(os.PathSeparator) {
+			return fmt.Errorf("%w: Standard authoring Docker command %q has an incomplete executable lock", ErrInvalidDeploymentOperationCatalogLock, command.CommandID)
+		}
+		if err := command.ContentSHA256.Validate(); err != nil {
+			return fmt.Errorf("%w: Standard authoring Docker command %q fingerprint: %v", ErrInvalidDeploymentOperationCatalogLock, command.CommandID, err)
 		}
 	}
 	return nil

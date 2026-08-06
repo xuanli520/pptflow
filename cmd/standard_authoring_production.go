@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/app"
 	"github.com/purplevoid/harbor-factory/internal/harbor/codeedge"
@@ -138,8 +139,22 @@ func newStandardAuthoringProductionComposition(config standardAuthoringProductio
 	if err := admission.Validate(); err != nil {
 		return nil, fmt.Errorf("construct Standard authoring CodeEdge task admission contract: %w", err)
 	}
+	dockerCommands, err := bundle.Lock.StandardAuthoringDockerCommandLocks()
+	if err != nil {
+		return nil, fmt.Errorf("load Standard authoring locked Docker commands: %w", err)
+	}
+	commandTimeout, err := standardAuthoringCandidateCommandTimeout(profile)
+	if err != nil {
+		return nil, err
+	}
+	candidateHarness, err := app.NewStandardAuthoringDockerHarness(app.StandardAuthoringDockerHarnessConfig{
+		ManagedRoot: config.ManagedRoot, LockedCommands: dockerCommands, CommandTimeout: commandTimeout,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("construct Standard authoring Docker harness: %w", err)
+	}
 	materializer, err := app.NewStandardAuthoringMaterializeExecutor(app.StandardAuthoringMaterializeExecutorConfig{
-		ManagedRoot: config.ManagedRoot, Store: config.Store, Admission: &admission,
+		ManagedRoot: config.ManagedRoot, Store: config.Store, Admission: &admission, CandidateHarness: candidateHarness,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("construct Standard authoring materializer: %w", err)
@@ -187,6 +202,21 @@ func standardAuthoringTaskAdmissionProfile() codeedge.Profile {
 		},
 		ProtectedEnvironmentVariables: []string{"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "OPUS_HARBOR_BASE_URL", "QWEN_HARBOR_BASE_URL"},
 	}
+}
+
+// standardAuthoringCandidateCommandTimeout uses the owning template's frozen
+// host verification attempt budget. The outer stage context remains the final
+// deadline, while the Docker runtime must not impose the shorter package
+// admission ceiling on a potentially long environment build.
+func standardAuthoringCandidateCommandTimeout(profile workflowadapter.ExecutionProfile) (time.Duration, error) {
+	if err := profile.Validate(); err != nil {
+		return 0, err
+	}
+	budget, found := profile.Budget(workflowkit.StageKey(workflowadapter.HostCandidateVerify))
+	if !found || budget.AttemptTimeout <= 0 {
+		return 0, fmt.Errorf("Standard authoring profile omits a usable command budget for %q", workflowadapter.HostCandidateVerify)
+	}
+	return budget.AttemptTimeout, nil
 }
 
 func standardAuthoringLockedGit(lock stageprovider.DeploymentOperationCatalogLock) (stageprovider.LocalExecutableLock, error) {

@@ -560,6 +560,7 @@ type DeploymentOperationCatalogLock struct {
 	HarborFlowBuild                   HarborFlowBuildIdentity                `json:"harbor_flow_build"`
 	StandardAuthoringExecutionProfile *StandardAuthoringExecutionProfileLock `json:"standard_authoring_execution_profile,omitempty"`
 	StandardAuthoringSSHTransport     *StandardAuthoringSSHTransportLock     `json:"standard_authoring_ssh_transport,omitempty"`
+	StandardAuthoringDockerCommands   []LocalExecutableLock                  `json:"standard_authoring_docker_commands,omitempty"`
 	Operations                        []DeploymentOperationCatalogLockRecord `json:"operations"`
 }
 
@@ -573,6 +574,7 @@ func (lock DeploymentOperationCatalogLock) Clone() DeploymentOperationCatalogLoc
 		transport := lock.StandardAuthoringSSHTransport.Clone()
 		lock.StandardAuthoringSSHTransport = &transport
 	}
+	lock.StandardAuthoringDockerCommands = append([]LocalExecutableLock(nil), lock.StandardAuthoringDockerCommands...)
 	operations := lock.Operations
 	lock.Operations = make([]DeploymentOperationCatalogLockRecord, len(operations))
 	for index, operation := range operations {
@@ -674,6 +676,24 @@ func (lock DeploymentOperationCatalogLock) StandardAuthoringSSHTransportLock() (
 	}
 	return lock.StandardAuthoringSSHTransport.Clone(), nil
 }
+
+// StandardAuthoringDockerCommandLocks returns the three locked Docker
+// executables that back the Standard authoring host candidate verifier. The
+// commands are deployment-owned identities, never a PATH fallback or a
+// caller-supplied executable.
+func (lock DeploymentOperationCatalogLock) StandardAuthoringDockerCommandLocks() ([]LocalExecutableLock, error) {
+	if !workflowadapter.IsStandardAuthoringWorkflowTemplate(lock.CatalogReceipt.Template) {
+		return nil, fmt.Errorf("%w: Standard authoring Docker commands require the Standard authoring template", ErrInvalidDeploymentOperationCatalogLock)
+	}
+	if len(lock.StandardAuthoringDockerCommands) == 0 {
+		return nil, fmt.Errorf("%w: Standard authoring Docker commands are required", ErrInvalidDeploymentOperationCatalogLock)
+	}
+	commands := make([]LocalExecutableLock, len(lock.StandardAuthoringDockerCommands))
+	for index, command := range lock.StandardAuthoringDockerCommands {
+		commands[index] = command
+	}
+	return commands, nil
+}
 func (lock DeploymentOperationCatalogLock) CanonicalJSON() ([]byte, error) {
 	if err := lock.Validate(); err != nil {
 		return nil, err
@@ -722,6 +742,7 @@ func ParseDeploymentOperationCatalogLockJSON(raw []byte) (DeploymentOperationCat
 		CatalogReceipt: document.CatalogReceipt, HarborFlowBuild: document.HarborFlowBuild,
 		StandardAuthoringExecutionProfile: document.StandardAuthoringExecutionProfile,
 		StandardAuthoringSSHTransport:     document.StandardAuthoringSSHTransport,
+		StandardAuthoringDockerCommands:   append([]LocalExecutableLock(nil), document.StandardAuthoringDockerCommands...),
 		Operations:                        document.Operations,
 	}
 	if err := lock.Validate(); err != nil {
@@ -752,6 +773,7 @@ type deploymentOperationCatalogLockDocument struct {
 	HarborFlowBuild                   HarborFlowBuildIdentity                `json:"harbor_flow_build"`
 	StandardAuthoringExecutionProfile *StandardAuthoringExecutionProfileLock `json:"standard_authoring_execution_profile,omitempty"`
 	StandardAuthoringSSHTransport     *StandardAuthoringSSHTransportLock     `json:"standard_authoring_ssh_transport,omitempty"`
+	StandardAuthoringDockerCommands   []LocalExecutableLock                  `json:"standard_authoring_docker_commands,omitempty"`
 	Operations                        []DeploymentOperationCatalogLockRecord `json:"operations"`
 }
 

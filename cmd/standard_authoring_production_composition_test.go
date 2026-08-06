@@ -194,6 +194,7 @@ func standardAuthoringProductionTestDeployment(t *testing.T) (string, *stageprov
 		HarborFlowBuild:                   stageprovider.HarborFlowBuildIdentity{Module: "github.com/purplevoid/harbor-factory", Version: "v2.0.0", Commit: strings.Repeat("a", 40), ContentSHA256: workflowkit.SHA256Fingerprint([]byte("standard-authoring-composition-test"))},
 		StandardAuthoringExecutionProfile: &stageprovider.StandardAuthoringExecutionProfileLock{Profile: standardAuthoringProductionTestProfile(t, catalog.Template())},
 		StandardAuthoringSSHTransport:     standardAuthoringProductionTestSSHTransport(t, deploymentRoot),
+		StandardAuthoringDockerCommands:   standardAuthoringProductionTestDockerCommands(),
 		Operations:                        operations,
 	}
 	canonical, err := lock.CanonicalJSON()
@@ -204,6 +205,17 @@ func standardAuthoringProductionTestDeployment(t *testing.T) (string, *stageprov
 		t.Fatal(err)
 	}
 	return deploymentRoot, catalog, lock
+}
+
+func standardAuthoringProductionTestDockerCommands() []stageprovider.LocalExecutableLock {
+	command := stageprovider.LocalExecutableLock{
+		AbsolutePath: "/usr/bin/docker", Version: "29.5.2", ContentSHA256: workflowkit.SHA256Fingerprint([]byte("standard-authoring-docker")),
+	}
+	return []stageprovider.LocalExecutableLock{
+		{CommandID: stageprovider.StandardAuthoringDockerBuildCommandID, AbsolutePath: command.AbsolutePath, Version: command.Version, ContentSHA256: command.ContentSHA256},
+		{CommandID: stageprovider.StandardAuthoringInitialVerifyCommandID, AbsolutePath: command.AbsolutePath, Version: command.Version, ContentSHA256: command.ContentSHA256},
+		{CommandID: stageprovider.StandardAuthoringOracleVerifyCommandID, AbsolutePath: command.AbsolutePath, Version: command.Version, ContentSHA256: command.ContentSHA256},
+	}
 }
 
 func standardAuthoringProductionTestProfile(t *testing.T, reference workflowadapter.TemplateReference) workflowadapter.ExecutionProfile {

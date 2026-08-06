@@ -51,6 +51,7 @@ type buildConfig struct {
 	sshExecutable     string
 	sshWrapperShell   string
 	sshKnownHosts     string
+	dockerExecutable  string
 	codexNode         string
 	codexLauncher     string
 	codexHome         string
@@ -72,6 +73,7 @@ func main() {
 	flag.StringVar(&config.sshExecutable, "ssh-executable", "", "absolute locked OpenSSH executable for source capture")
 	flag.StringVar(&config.sshWrapperShell, "ssh-wrapper-shell", "", "absolute locked POSIX shell for the generated SSH wrapper")
 	flag.StringVar(&config.sshKnownHosts, "ssh-known-hosts", "", "lock-bound deployment-relative OpenSSH known_hosts asset")
+	flag.StringVar(&config.dockerExecutable, "docker-executable", "", "absolute locked Docker executable backing host candidate verification")
 	flag.StringVar(&config.codexNode, "codex-node", "", "absolute locked Node executable")
 	flag.StringVar(&config.codexLauncher, "codex-launcher", "", "absolute locked Codex JavaScript launcher")
 	flag.StringVar(&config.codexHome, "codex-home", "", "absolute controlled CODEX_HOME directory")
@@ -149,6 +151,10 @@ func build(config buildConfig) (stageprovider.DeploymentOperationCatalogLock, er
 		return stageprovider.DeploymentOperationCatalogLock{}, err
 	}
 	codex, err := discoverCodexLock(config)
+	if err != nil {
+		return stageprovider.DeploymentOperationCatalogLock{}, err
+	}
+	dockerCommands, err := discoverStandardAuthoringDockerCommandLocks(config.dockerExecutable)
 	if err != nil {
 		return stageprovider.DeploymentOperationCatalogLock{}, err
 	}
@@ -245,6 +251,7 @@ func build(config buildConfig) (stageprovider.DeploymentOperationCatalogLock, er
 		LockID: config.lockID, LockVersion: config.lockVersion, CatalogReceipt: catalog.Receipt(), HarborFlowBuild: build,
 		StandardAuthoringExecutionProfile: &stageprovider.StandardAuthoringExecutionProfileLock{Profile: profile},
 		StandardAuthoringSSHTransport:     &sshTransport,
+		StandardAuthoringDockerCommands:   dockerCommands,
 		Operations:                        operations,
 	}
 	if _, err := stageprovider.NewDeploymentOperationCatalogLockResolver(catalog, lock); err != nil {
@@ -283,7 +290,7 @@ func validateConfig(config *buildConfig) error {
 		return errors.New("build configuration is required")
 	}
 	var err error
-	for _, field := range []*string{&config.sourceRoot, &config.catalogPath, &config.manifestPath, &config.profilePath, &config.contractRoot, &config.outputPath, &config.gitExecutable, &config.sshExecutable, &config.sshWrapperShell, &config.sshKnownHosts, &config.codexNode, &config.codexLauncher, &config.codexHome} {
+	for _, field := range []*string{&config.sourceRoot, &config.catalogPath, &config.manifestPath, &config.profilePath, &config.contractRoot, &config.outputPath, &config.gitExecutable, &config.sshExecutable, &config.sshWrapperShell, &config.sshKnownHosts, &config.dockerExecutable, &config.codexNode, &config.codexLauncher, &config.codexHome} {
 		*field, err = cleanAbsolutePath(*field)
 		if err != nil {
 			return err
@@ -335,6 +342,34 @@ func discoverGitLock(path string) (stageprovider.LocalExecutableLock, error) {
 		return stageprovider.LocalExecutableLock{}, errors.New("locked Git version is invalid")
 	}
 	return stageprovider.LocalExecutableLock{CommandID: stageprovider.StandardAuthoringGitSnapshotCommandID, AbsolutePath: path, Version: version, ContentSHA256: content}, nil
+}
+
+// discoverStandardAuthoringDockerCommandLocks locks the one approved Docker
+// client three times, once per harness command identity. The verifier treats
+// docker-build, initial-verify, and oracle-verify as distinct operations even
+// though they share the same controlled executable and version.
+func discoverStandardAuthoringDockerCommandLocks(path string) ([]stageprovider.LocalExecutableLock, error) {
+	content, err := fingerprintRegularFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("Docker executable: %w", err)
+	}
+	output, err := probe(path, []string{"PATH=/usr/local/bin:/usr/bin:/bin"}, "--version")
+	if err != nil || !strings.HasPrefix(output, "Docker version ") {
+		return nil, errors.New("locked Docker --version probe failed")
+	}
+	version := strings.TrimPrefix(output, "Docker version ")
+	if comma := strings.IndexByte(version, ','); comma >= 0 {
+		version = version[:comma]
+	}
+	if version == "" || strings.ContainsAny(version, " \t\r\n") {
+		return nil, errors.New("locked Docker version is invalid")
+	}
+	commands := []stageprovider.LocalExecutableLock{
+		{CommandID: stageprovider.StandardAuthoringDockerBuildCommandID, AbsolutePath: path, Version: version, ContentSHA256: content},
+		{CommandID: stageprovider.StandardAuthoringInitialVerifyCommandID, AbsolutePath: path, Version: version, ContentSHA256: content},
+		{CommandID: stageprovider.StandardAuthoringOracleVerifyCommandID, AbsolutePath: path, Version: version, ContentSHA256: content},
+	}
+	return commands, nil
 }
 
 func discoverStandardAuthoringSSHTransport(config buildConfig) (stageprovider.StandardAuthoringSSHTransportLock, error) {
