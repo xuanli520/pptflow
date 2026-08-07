@@ -104,7 +104,7 @@ stage attempt, and an existing Run's frozen definition is not retroactively
 changed.
 
 The catalog and matching agent lock must both carry the approved
-`deepseek-v4-flash` / `max` pair. The invocation passes that effort to both the
+`gpt-5.6-terra` / `high` pair. The invocation passes that effort to both the
 conversation and each turn; a local Codex default cannot alter it. Historical
 locks without an explicit effort remain readable for audit and reconciliation,
 but the current Standard composition rejects them before an effect can start.

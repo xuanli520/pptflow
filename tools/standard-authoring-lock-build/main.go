@@ -77,7 +77,7 @@ func main() {
 	flag.StringVar(&config.codexNode, "codex-node", "", "absolute locked Node executable")
 	flag.StringVar(&config.codexLauncher, "codex-launcher", "", "absolute locked Codex JavaScript launcher")
 	flag.StringVar(&config.codexHome, "codex-home", "", "absolute controlled CODEX_HOME directory")
-	flag.StringVar(&config.codexModelVersion, "codex-model-version", "", "approved immutable deepseek-v4-flash model version")
+	flag.StringVar(&config.codexModelVersion, "codex-model-version", "", "approved immutable Codex model version")
 	flag.Parse()
 	if flag.NArg() != 0 {
 		fail("unexpected positional arguments")

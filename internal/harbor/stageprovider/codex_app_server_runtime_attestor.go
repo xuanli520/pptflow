@@ -41,8 +41,8 @@ const (
 	// runtimes remain available through AgentModelLock without this
 	// Codex-specific extension.
 	CodexAppServerProductionAgentID         = "codex-app-server"
-	CodexAppServerProductionModelID         = "deepseek-v4-flash"
-	CodexAppServerProductionReasoningEffort = workflowadapter.AgentReasoningEffortMax
+	CodexAppServerProductionModelID         = "gpt-5.6-terra"
+	CodexAppServerProductionReasoningEffort = workflowadapter.AgentReasoningEffortHigh
 
 	CodexAppServerApprovalPolicyNever         = "never"
 	CodexAppServerSandboxModeReadOnly         = "read-only"

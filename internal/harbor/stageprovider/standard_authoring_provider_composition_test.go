@@ -219,7 +219,7 @@ func standardAuthoringRepairCompositionFixture(t *testing.T) (*DeploymentOperati
 			ExecutionKind: workflowadapter.StageOperationPayloadAgentTurn,
 			AgentModel: &AgentModelLock{
 				AgentID: payload.AgentID, AgentVersion: "0.133.0", ModelID: payload.ModelID,
-				ModelVersion: "deepseek-v4-flash",
+				ModelVersion: "gpt-5.6-terra",
 			},
 			CodexAppServer: &codex,
 			StandardAuthoringContract: &StandardAuthoringContractLock{Format: StandardAuthoringContractLockFormat, Version: StandardAuthoringContractLockVersion,
@@ -269,7 +269,7 @@ func standardAuthoringAgentOnlyCompositionFixture(t *testing.T) (*DeploymentOper
 			ExecutionKind: workflowadapter.StageOperationPayloadAgentTurn,
 			AgentModel: &AgentModelLock{
 				AgentID: payload.AgentID, AgentVersion: "0.133.0", ModelID: payload.ModelID,
-				ModelVersion: "deepseek-v4-flash",
+				ModelVersion: "gpt-5.6-terra",
 			},
 			CodexAppServer: &codex,
 			StandardAuthoringContract: &StandardAuthoringContractLock{Format: StandardAuthoringContractLockFormat, Version: StandardAuthoringContractLockVersion,

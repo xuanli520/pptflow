@@ -80,7 +80,7 @@ mistaken for an enabled production operation.
   catalog-attested and cannot fall back to a PATH-discovered executable, an
   ambient home directory, ambient authentication, or a default model.
 - The Standard authoring production composition installs the single
-  `agent.turn` provider pinned to `deepseek-v4-flash` / `max` from the
+  `agent.turn` provider pinned to `gpt-5.6-terra` / `high` from the
   deployment lock; no PATH-discovered executable, ambient home directory,
   ambient authentication, or default model is accepted.
 

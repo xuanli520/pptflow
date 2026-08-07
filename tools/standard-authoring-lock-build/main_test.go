@@ -203,7 +203,7 @@ func TestProductionCodexStageAssetsRequireFrozenModelAndReasoningEffort(t *testi
 		for name, mutate := range map[string]func(*workflowadapter.AgentTurnOperationPayload){
 			"model drift": func(candidate *workflowadapter.AgentTurnOperationPayload) { candidate.ModelID = "other-model" },
 			"reasoning effort drift": func(candidate *workflowadapter.AgentTurnOperationPayload) {
-				candidate.ReasoningEffort = workflowadapter.AgentReasoningEffortHigh
+				candidate.ReasoningEffort = workflowadapter.AgentReasoningEffortMax
 			},
 		} {
 			t.Run(string(registration.Stage.Key)+"/"+name, func(t *testing.T) {
