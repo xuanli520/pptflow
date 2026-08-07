@@ -39,28 +39,24 @@ type TaskItem struct {
 // TaskRunItem is the terminal-facing copy of one durable Run record. It is
 // populated only from the task-board application projection.
 type TaskRunItem struct {
-	ID                    string
-	ParentRunID           string
-	AuthoringEvidence     *app.TaskBoardAuthoringEvidence
-	AgentTurnTranscripts  []app.TaskBoardAgentTranscript
-	Status                string
-	CurrentStage          string
-	OperatorSummary       *app.TaskBoardOperatorSummary
-	FailureStage          string
-	FailureClass          string
-	FailureReason         string
-	FailureCode           string
-	FailureSummary        string
-	FailureJobID          string
-	FailureArtifactID     string
-	FailureRecordedAt     *time.Time
+	ID                   string
+	AuthoringEvidence    *app.TaskBoardAuthoringEvidence
+	AgentTurnTranscripts []app.TaskBoardAgentTranscript
+	Status               string
+	CurrentStage         string
+	OperatorSummary      *app.TaskBoardOperatorSummary
+	FailureStage         string
+	FailureCode          string
+	FailureSummary       string
+	FailureJobID         string
+	FailureArtifactID    string
+	FailureRecordedAt    *time.Time
+	// FailureRecoveryAction selects the recovery sentence shown to an operator.
 	FailureRecoveryAction app.TaskBoardFailureRecoveryAction
-	CanRedrive            bool
 	CreatedAt             time.Time
 	StartedAt             *time.Time
 	FinishedAt            *time.Time
 	LogPath               string
-	HasLog                bool
 	CanRetry              bool
 	RetryReason           string
 	RetryStrategy         app.TaskBoardRetryStrategy
@@ -158,17 +154,17 @@ func renderTaskCard(item TaskItem, width int, selected bool) string {
 	switch item.State {
 	case TaskPending:
 		if item.AuthoringLaunch != nil {
-			lines = append(lines, failStyleV2.Render("源码捕获失败"))
+			lines = append(lines, styleFail.Render("源码捕获失败"))
 		} else if item.Review != nil {
 			lines = append(lines, statusRunningStyle.Render("等待审核"))
 		} else if item.OpenReviews > 1 {
-			lines = append(lines, failStyleV2.Render("多个审核待处理"))
+			lines = append(lines, styleFail.Render("多个审核待处理"))
 		} else if summary := displayOperatorSummary(item.OperatorSummary); summary != "" {
 			lines = append(lines, mutedStyle.Render(truncateMiddle(summary, width-4)))
 		} else if item.RunStatus == "" {
 			lines = append(lines, mutedStyle.Render("等待启动"))
 		} else if label, failed := taskCardFailureLabel(item.RunStatus); failed {
-			lines = append(lines, failStyleV2.Render("失败："+label))
+			lines = append(lines, styleFail.Render("失败："+label))
 		} else {
 			lines = append(lines, mutedStyle.Render(item.RunStatus))
 		}

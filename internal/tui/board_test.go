@@ -62,16 +62,30 @@ func TestDetailGroupsCurrentRunHistoryFailureAndLogPath(t *testing.T) {
 			{
 				ID: "run-current", Status: "failed_recoverable", CurrentStage: "repo_prepare",
 				FailureStage: "repo_prepare", FailureCode: "stage.source_unavailable", FailureSummary: "The source could not be read safely.",
-				LogPath: "/managed/logs/run-current.log", HasLog: true,
+				LogPath: "/managed/logs/run-current.log",
 			},
 			{ID: "run-previous", Status: "succeeded"},
 		},
 	})
+	// The default body carries decision-necessary facts only: that a log exists
+	// and how to open it. The managed path itself is a diagnostic identifier and
+	// lives behind [e], so a short terminal spends no rows on it.
 	rendered := ansi.Strip(detail.View(132, 40))
-	for _, expected := range []string{"来源", "当前运行", "失败原因", "运行记录", "/managed/logs/run-current.log", "stage.source_unavailable", "The source could not be read safely."} {
+	for _, expected := range []string{"来源", "当前运行", "失败原因", "运行记录", "可读取（按 l）", "stage.source_unavailable", "The source could not be read safely."} {
 		if !strings.Contains(rendered, expected) {
 			t.Fatalf("detail missing %q:\n%s", expected, rendered)
 		}
+	}
+	if strings.Contains(rendered, "/managed/logs/run-current.log") {
+		t.Fatalf("collapsed detail spent rows on the managed log path:\n%s", rendered)
+	}
+
+	// Expanding must still reach it: collapsing is a layout decision, never a
+	// reason for a durable identifier to become unreachable from the terminal.
+	detail.ToggleEvidence()
+	expanded := ansi.Strip(detail.View(132, 40))
+	if !strings.Contains(expanded, "/managed/logs/run-current.log") {
+		t.Fatalf("expanded detail lost the managed log path:\n%s", expanded)
 	}
 }
 
@@ -94,6 +108,11 @@ func TestDetailShowsBoundedAuthoringEvidence(t *testing.T) {
 			},
 		}},
 	})
+	// Evidence is audit data, not decision data, so the default body omits it.
+	if collapsed := ansi.Strip(detail.View(180, 60)); strings.Contains(collapsed, "根契约") {
+		t.Fatalf("collapsed detail rendered contract evidence:\n%s", collapsed)
+	}
+	detail.ToggleEvidence()
 	rendered := ansi.Strip(detail.View(180, 60))
 	for _, expected := range []string{"根契约", "声明比对", "最终谱系", "Task one", "task_specification"} {
 		if !strings.Contains(rendered, expected) {
@@ -118,17 +137,28 @@ func TestDetailShowsDurableFailureRecordAndRecoveryAction(t *testing.T) {
 			FailureRecoveryAction: app.TaskBoardFailureRecoveryReconcile,
 		}},
 	})
+	// The failure section keeps what an operator decides on: which stage failed,
+	// the closed failure code, when it was recorded, and the recovery action.
 	rendered := ansi.Strip(detail.View(132, 40))
-	for _, expected := range []string{"失败阶段", "错误码", "handoff.definition_unavailable", "Job ID", "job-handoff", "Artifact ID", "artifact-handoff", "记录时间", "恢复操作", "显式 reconcile"} {
+	for _, expected := range []string{"失败阶段", "错误码", "handoff.definition_unavailable", "记录时间", "恢复操作", "显式 reconcile"} {
 		if !strings.Contains(rendered, expected) {
 			t.Fatalf("durable failure detail missing %q:\n%s", expected, rendered)
 		}
 	}
+	// The durable Job and Artifact IDs are correlation identifiers for the store,
+	// not decision inputs, so they move behind [e] rather than being dropped.
+	detail.ToggleEvidence()
+	expanded := ansi.Strip(detail.View(132, 40))
+	for _, expected := range []string{"Job ID", "job-handoff", "Artifact ID", "artifact-handoff"} {
+		if !strings.Contains(expanded, expected) {
+			t.Fatalf("expanded detail missing failure identifier %q:\n%s", expected, expanded)
+		}
+	}
+	detail.ToggleEvidence()
 
 	detail.task.Runs[0].Status = "failed_terminal"
 	detail.task.Runs[0].FailureCode = "handoff.artifact_lineage_invalid"
 	detail.task.Runs[0].FailureRecoveryAction = app.TaskBoardFailureRecoveryRepairOrNewRun
-	detail.task.Runs[0].CanRedrive = false
 	rendered = ansi.Strip(detail.View(132, 40))
 	if strings.Contains(rendered, "redrive") || !strings.Contains(rendered, "run restart 重跑") {
 		t.Fatalf("terminal failure recovery detail =\n%s", rendered)
@@ -140,14 +170,23 @@ func TestDetailShowsDurableFailureRecordAndRecoveryAction(t *testing.T) {
 	}
 }
 
+// TestDetailDoesNotRenderLegacyRawFailureReason pins the boundary rather than a
+// field: the app-layer Run keeps FailureReason for legacy compatibility, but the
+// terminal projection must not carry it across, so raw provider output and any
+// credential inside it can never reach a rendered screen.
 func TestDetailDoesNotRenderLegacyRawFailureReason(t *testing.T) {
-	detail := newDetailModel(&TaskItem{
-		Name: "Task one", Slug: "task-one", RunID: "run-current",
-		Runs: []TaskRunItem{{
+	pending, _, _ := taskItemsForSnapshot(app.TaskBoardSnapshot{Tasks: []app.TaskBoardTask{{
+		ID: "task-1", Title: "Task one", Column: app.TaskBoardPending, RunID: "run-current",
+		Runs: []app.TaskBoardRun{{
 			ID: "run-current", Status: "in_doubt", FailureStage: "materialize_task",
 			FailureReason: "provider output from /private/handoff with sk-sensitive-token",
 		}},
-	})
+	}}})
+	if len(pending) != 1 {
+		t.Fatalf("task items = %+v", pending)
+	}
+	detail := newDetailModel(&pending[0])
+	detail.ToggleEvidence()
 	rendered := ansi.Strip(detail.View(100, 28))
 	if strings.Contains(rendered, "private/handoff") || strings.Contains(rendered, "sk-sensitive-token") {
 		t.Fatalf("detail rendered legacy raw failure reason:\n%s", rendered)
@@ -172,25 +211,59 @@ func TestDetailOffersTaskContinuationRecovery(t *testing.T) {
 	}
 }
 
-func TestLogModelScrollsBoundedContent(t *testing.T) {
+// TestLogModelScrollsRawContent covers the fallback path: a log with no parsed
+// records still scrolls as plain text and reports a line position.
+func TestLogModelScrollsRawContent(t *testing.T) {
 	logs := newLogModel(&TaskItem{Name: "Task one"}, app.TaskBoardLog{
 		RunID: "run-1", Path: "/managed/logs/run-1.log", Content: strings.Repeat("log line\n", 32),
 	})
-	logs.MoveDown(80, 14)
-	if logs.offset != 1 {
-		t.Fatalf("log offset after down = %d, want 1", logs.offset)
+	// Render once so the pane learns its size before scrolling.
+	logs.View(80, 14)
+	first := logs.pane.FirstVisibleLine()
+	logs.MoveDown()
+	logs.View(80, 14)
+	if logs.pane.FirstVisibleLine() != first+1 {
+		t.Fatalf("raw log first visible line after down = %d, want %d", logs.pane.FirstVisibleLine(), first+1)
 	}
-	logs.PageDown(80, 14)
-	if logs.offset <= 1 {
-		t.Fatalf("log page down did not advance: %d", logs.offset)
-	}
-	logs.GoToEnd(80, 14)
-	if logs.offset == 0 {
-		t.Fatal("log end did not move through multi-line content")
+	logs.GoToEnd()
+	logs.View(80, 14)
+	if logs.pane.LastVisibleLine() != logs.pane.LineCount() {
+		t.Fatalf("raw log end = %d, want %d", logs.pane.LastVisibleLine(), logs.pane.LineCount())
 	}
 	rendered := ansi.Strip(logs.View(80, 14))
 	if !strings.Contains(rendered, "/managed/logs/run-1.log") || !strings.Contains(rendered, "行 ") {
 		t.Fatalf("log view lacks path or scroll position:\n%s", rendered)
+	}
+}
+
+// TestLogModelRendersRecordSummaries pins the readability fix: a worker log is
+// shown as one line per durable record, and the raw JSON stays behind [R].
+func TestLogModelRendersRecordSummaries(t *testing.T) {
+	recorded := time.Date(2026, 8, 7, 9, 15, 0, 0, time.UTC)
+	logs := newLogModel(&TaskItem{Name: "Task one"}, app.TaskBoardLog{
+		RunID: "run-1", Path: "/managed/logs/run-1.log",
+		Content: `{"format":"harbor.run-worker-log-record.v1"}`,
+		Records: []app.TaskBoardLogRecord{
+			{Sequence: 1, ObservedAt: &recorded, RunStatus: "running", JobCommandType: "stage_attempt.execute", JobState: "succeeded"},
+			{Sequence: 2, ObservedAt: &recorded, RunStatus: "waiting_review", StoppedFor: "waiting_review", CycleEmpty: true},
+		},
+	})
+	rendered := ansi.Strip(logs.View(100, 20))
+	for _, want := range []string{"stage_attempt.execute", "stopped_for:waiting_review", "记录 2 / 2"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("record view missing %q:\n%s", want, rendered)
+		}
+	}
+	if strings.Contains(rendered, "harbor.run-worker-log-record.v1") {
+		t.Fatalf("record view leaked raw JSON:\n%s", rendered)
+	}
+	// The newest record is selected so the operator lands on what just happened.
+	if logs.selected != 1 {
+		t.Fatalf("selected record = %d, want the newest", logs.selected)
+	}
+	logs.ToggleRaw()
+	if raw := ansi.Strip(logs.View(100, 20)); !strings.Contains(raw, "harbor.run-worker-log-record.v1") {
+		t.Fatalf("raw fallback did not expose the original bytes:\n%s", raw)
 	}
 }
 

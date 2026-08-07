@@ -94,9 +94,9 @@ var (
 			Foreground(colorPrimary).
 			Bold(true)
 
-	passStyleV2 = lipgloss.NewStyle().
+	stylePass = lipgloss.NewStyle().
 			Foreground(colorSuccess)
 
-	failStyleV2 = lipgloss.NewStyle().
+	styleFail = lipgloss.NewStyle().
 			Foreground(colorDanger)
 )

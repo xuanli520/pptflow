@@ -265,12 +265,25 @@ const (
 
 // TaskBoardLog is a bounded read of a worker log selected through a Run's
 // durable handoff record. The TUI receives content, not a filesystem handle.
+//
+// Records holds whole worker records parsed from the tail. Content keeps the
+// verbatim text they came from so the terminal can always fall back to the
+// original bytes; neither field is a filesystem handle or a live stream.
 type TaskBoardLog struct {
-	RunID     string
-	Path      string
-	Content   string
-	Message   string
+	RunID   string
+	Path    string
+	Content string
+	Records []TaskBoardLogRecord
+	// HandoffSummary reports how many worker processes contributed to the file.
+	HandoffSummary string
+	Message        string
+	// Truncated means older whole records were dropped from Records. It does not
+	// mean any returned record is partial: every record in Records is complete.
 	Truncated bool
+	// RawTruncated means Content was clipped to its byte budget. Records can be
+	// complete while the raw text behind them is not, so the two are reported
+	// separately and the terminal can label each view honestly.
+	RawTruncated bool
 }
 
 // TaskBoardSnapshot is a read-only point-in-time board projection.
@@ -454,6 +467,7 @@ type TaskBoardGateway interface {
 	List(context.Context) (TaskBoardSnapshot, error)
 	StartAuthoring(context.Context, TaskBoardStartAuthoringRequest) (TaskBoardMutation, error)
 	DecideReview(context.Context, TaskBoardDecideReviewRequest) (TaskBoardMutation, error)
+	InspectReview(context.Context, TaskBoardInspectReviewRequest) (TaskBoardReviewInspection, error)
 	ReadRunLog(context.Context, TaskBoardReadRunLogRequest) (TaskBoardLog, error)
 	PreviewRunRecovery(context.Context, TaskBoardPreviewRunRecoveryRequest) (TaskBoardRecoveryPreview, error)
 	PreviewStandardProtocolRetry(context.Context, TaskBoardPreviewStandardProtocolRetryRequest) (TaskBoardStandardProtocolRetryPreview, error)
@@ -778,22 +792,31 @@ func (service *TaskBoardService) ReadRunLog(ctx context.Context, request TaskBoa
 		return log, nil
 	}
 
-	start := max(int64(0), info.Size()-taskBoardLogReadLimit)
+	// Read by record boundary, not by byte window. One worker record can exceed
+	// the old 64 KiB window on its own, so a fixed byte tail almost always began
+	// and ended mid-record and the terminal could only ever show a fragment.
+	start := max(int64(0), info.Size()-taskBoardLogScanLimit)
 	content := make([]byte, info.Size()-start)
 	count, readErr := file.ReadAt(content, start)
 	if readErr != nil && readErr != io.EOF {
 		log.Message = "读取日志失败: " + readErr.Error()
 		return log, nil
 	}
-	log.Truncated = start > 0
-	log.Content = strings.ToValidUTF8(string(content[:count]), "?")
-	if log.Truncated {
-		if lineEnd := strings.IndexByte(log.Content, '\n'); lineEnd >= 0 {
-			log.Content = log.Content[lineEnd+1:]
-		}
-	}
-	if log.Content == "" {
+	text := strings.ToValidUTF8(string(content[:count]), "?")
+	tail := readTaskBoardLogTail(text, taskBoardLogRecordLimit)
+	log.Records = tail.Records
+	log.Content = tail.Raw
+	// A scan window that began past the start of the file means earlier records
+	// exist that this read did not return.
+	log.Truncated = tail.RecordsDropped || start > 0
+	log.RawTruncated = tail.RawTruncated
+	log.HandoffSummary = taskBoardLogHandoffSummary(handoffs)
+	if strings.TrimSpace(log.Content) == "" && len(log.Records) == 0 {
 		log.Message = "日志文件当前为空"
+	} else if len(log.Records) == 0 {
+		// Text without a single record boundary is still returned verbatim, but the
+		// operator is told why it was not broken into records.
+		log.Message = "日志内容不是 worker 记录格式，已按原文显示"
 	}
 	return log, nil
 }

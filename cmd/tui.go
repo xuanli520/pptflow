@@ -12,7 +12,7 @@ import (
 
 // newLifecycleTUICommand opens the new task-board TUI backed by lifecycle services.
 func newLifecycleTUICommand(config *lifecycleCLIConfig) *cobra.Command {
-	return newLifecycleTUICommandWithRunner(config, tui.RunNewTUIAdapter)
+	return newLifecycleTUICommandWithRunner(config, tui.RunNewTUI)
 }
 
 // lifecycleTUIRunner exposes the TUI session so tests can inject a different runner.

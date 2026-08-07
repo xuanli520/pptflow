@@ -35,6 +35,9 @@ type taskBoardGatewayStub struct {
 	launchRetryRequests        []app.TaskBoardRetryAuthoringLaunchRequest
 	cancelRequests             []app.TaskBoardCancelRunRequest
 	log                        app.TaskBoardLog
+	inspectReviewRequests      []app.TaskBoardInspectReviewRequest
+	reviewInspection           app.TaskBoardReviewInspection
+	reviewInspectionErr        error
 	startErr                   error
 	decisionErr                error
 	recoveryPreview            app.TaskBoardRecoveryPreview
@@ -76,6 +79,18 @@ func (stub *taskBoardGatewayStub) DecideReview(_ context.Context, request app.Ta
 
 func (stub *taskBoardGatewayStub) ReadRunLog(context.Context, app.TaskBoardReadRunLogRequest) (app.TaskBoardLog, error) {
 	return stub.log, stub.logErr
+}
+
+func (stub *taskBoardGatewayStub) InspectReview(_ context.Context, request app.TaskBoardInspectReviewRequest) (app.TaskBoardReviewInspection, error) {
+	stub.inspectReviewRequests = append(stub.inspectReviewRequests, request)
+	inspection := stub.reviewInspection
+	if inspection.RequestID == "" {
+		inspection.RequestID = request.Review.RequestID
+	}
+	if inspection.Kind == "" {
+		inspection.Kind = request.Review.Kind
+	}
+	return inspection, stub.reviewInspectionErr
 }
 
 func (stub *taskBoardGatewayStub) PreviewRunRecovery(ctx context.Context, request app.TaskBoardPreviewRunRecoveryRequest) (app.TaskBoardRecoveryPreview, error) {
@@ -217,7 +232,7 @@ func TestAppModelRoutesBoardCommandsThroughGateway(t *testing.T) {
 		t.Fatalf("review confirmation = %+v", reviewModel.review)
 	}
 	reviewModel.review.reasonInput.SetValue("approve reviewed task")
-	updated, reviewCommand := reviewModel.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
+	updated, reviewCommand := reviewModel.handleKey(tea.KeyMsg{Type: tea.KeyCtrlS}, nil)
 	decisionMessage := reviewCommand()
 	if _, ok := decisionMessage.(taskBoardMutationMsg); !ok || len(stub.decisionRequests) != 1 || stub.decisionRequests[0].Decision != app.TaskBoardApprove || stub.decisionRequests[0].Reason != "approve reviewed task" || stub.decisionRequests[0].IdempotencyKey == "" {
 		t.Fatalf("review command = %#v, requests=%+v", decisionMessage, stub.decisionRequests)
@@ -245,7 +260,7 @@ func TestTaskItemsForSnapshotPreservesDurableFailureProjection(t *testing.T) {
 	run := pending[0].Runs[0]
 	if run.FailureCode != "handoff.definition_invalid" || run.FailureSummary != "The approved child definition is invalid." ||
 		run.FailureJobID != "job-1" || run.FailureArtifactID != "artifact-1" ||
-		run.FailureRecoveryAction != app.TaskBoardFailureRecoveryReconcile || run.CanRedrive {
+		run.FailureRecoveryAction != app.TaskBoardFailureRecoveryReconcile {
 		t.Fatalf("durable failure item = %+v", run)
 	}
 }
@@ -457,7 +472,7 @@ func TestAppModelRetriesFailedCommandsWithTheSameIdempotencyKey(t *testing.T) {
 	updated, _ = reviewModel.handleKey(keyRune('a'), nil)
 	reviewModel = updated.(appModel)
 	reviewModel.review.reasonInput.SetValue("approve reviewed task")
-	updated, command = reviewModel.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
+	updated, command = reviewModel.handleKey(tea.KeyMsg{Type: tea.KeyCtrlS}, nil)
 	reviewModel = updated.(appModel)
 	first = command().(taskBoardMutationMsg)
 	updated, _ = reviewModel.Update(first)
@@ -471,7 +486,7 @@ func TestAppModelRetriesFailedCommandsWithTheSameIdempotencyKey(t *testing.T) {
 	updated, _ = reviewModel.handleKey(keyRune('a'), nil)
 	reviewModel = updated.(appModel)
 	reviewModel.review.reasonInput.SetValue("approve reviewed task")
-	updated, command = reviewModel.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
+	updated, command = reviewModel.handleKey(tea.KeyMsg{Type: tea.KeyCtrlS}, nil)
 	_ = updated.(appModel)
 	_ = command().(taskBoardMutationMsg)
 	if len(stub.decisionRequests) != 2 || stub.decisionRequests[0].IdempotencyKey != stub.decisionRequests[1].IdempotencyKey {
@@ -1063,7 +1078,7 @@ func TestAppModelRequestsAuthoringChangesThenDispatchesRepairContinuation(t *tes
 		t.Fatalf("request-changes prompt = %+v", model.review)
 	}
 	model.review.reasonInput.SetValue("correct the generated tower-http paths")
-	updated, command := model.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
+	updated, command := model.handleKey(tea.KeyMsg{Type: tea.KeyCtrlS}, nil)
 	model = updated.(appModel)
 	if model.activeMutation != taskBoardReviewMutation || command == nil {
 		t.Fatalf("request-changes start = active:%q command:%v", model.activeMutation, command)
@@ -1136,7 +1151,7 @@ func TestAppModelSendsUntruncatedRequestChangesReasonThroughGateway(t *testing.T
 		t.Fatalf("request-changes prompt = %+v", model.review)
 	}
 	model.review.reasonInput.SetValue(wantReason)
-	updated, command := model.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, nil)
+	updated, command := model.handleKey(tea.KeyMsg{Type: tea.KeyCtrlS}, nil)
 	model = updated.(appModel)
 	if model.activeMutation != taskBoardReviewMutation || command == nil {
 		t.Fatalf("request-changes start = active:%q command:%v", model.activeMutation, command)

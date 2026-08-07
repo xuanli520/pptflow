@@ -111,7 +111,19 @@ func newRunWorkerCommandWithDependencies(config *lifecycleCLIConfig, dependencie
 				signals := make(chan os.Signal, 2)
 				signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 				defer signal.Stop(signals)
-				return runWorkerSessionWithSignals(ctx, session, signals)
+				result, runErr := runWorkerSessionWithSignals(ctx, session, signals)
+				if runErr != nil {
+					return nil, runErr
+				}
+				// A detached worker's stdout is appended to runs/<run>/worker.log,
+				// so whatever this command prints becomes that log's content. The
+				// full session result carries the frozen run manifest and the claimed
+				// job payload, which repeat identically on every handoff and made up
+				// the overwhelming majority of each record's bytes. Print the compact
+				// projection instead; RunWorkerSessionResult stays the in-process
+				// return value, so no caller or test contract on the Go structure
+				// changes.
+				return app.NewRunWorkerLogRecord(result), nil
 			})
 		},
 	}

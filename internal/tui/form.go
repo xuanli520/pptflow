@@ -451,7 +451,7 @@ func (m TaskInputModel) View(width int) string {
 			content += "\n正在加载配置..."
 		}
 		if m.validationErr != "" {
-			content += "\n" + failStyleV2.Render(m.validationErr)
+			content += "\n" + styleFail.Render(m.validationErr)
 		}
 		return inputStyle.Width(max(1, width-inputStyle.GetHorizontalFrameSize())).Render(content)
 	}
@@ -463,7 +463,7 @@ func (m TaskInputModel) View(width int) string {
 		m.objectiveInput.View() + "\n" +
 		m.reasonInput.View()
 	if m.validationErr != "" {
-		content += "\n" + failStyleV2.Render(m.validationErr)
+		content += "\n" + styleFail.Render(m.validationErr)
 	}
 	return inputStyle.Width(max(1, width-inputStyle.GetHorizontalFrameSize())).Render(content)
 }
