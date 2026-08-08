@@ -1187,6 +1187,12 @@ func TestAppTaskInputWithValidationErrorFitsTheWindow(t *testing.T) {
 		t.Fatal("empty authoring form did not render its validation error")
 	}
 	rendered := model.View()
+	plain := ansi.Strip(rendered)
+	for _, expected := range []string{"URL ", model.input.validationErr, "[enter] 提交", "[esc] 取消"} {
+		if !strings.Contains(plain, expected) {
+			t.Fatalf("authoring form did not render %q:\n%s", expected, plain)
+		}
+	}
 	assertAppWidth(t, rendered, model.width)
 	assertAppHeight(t, rendered, model.height)
 }

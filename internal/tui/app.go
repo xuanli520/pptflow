@@ -1034,6 +1034,8 @@ func (m appModel) View() string {
 		prompt = m.review.View(newChrome(m.width, m.height, status, "").contentWidth())
 	} else if m.action != nil {
 		prompt = m.action.View(newChrome(m.width, m.height, status, "").contentWidth())
+	} else if m.input.Visible() {
+		prompt = m.input.View(newChrome(m.width, m.height, status, "").contentWidth())
 	}
 	budget := newChrome(m.width, m.height, status, prompt)
 	contentWidth := budget.contentWidth()
@@ -1067,6 +1069,8 @@ func (m appModel) View() string {
 		footer = "[ctrl+s] 提交审核  [esc] 取消"
 	} else if m.action != nil {
 		footer = m.runActionFooterText()
+	} else if m.input.Visible() {
+		footer = m.taskInputFooterText()
 	}
 
 	sections := []string{headerStyle.Width(contentWidth).Render(appTitle), body}
@@ -1078,6 +1082,19 @@ func (m appModel) View() string {
 	}
 	sections = append(sections, footerStyle.Render(truncateDisplay(footer, contentWidth)))
 	return appStyle.Render(lipgloss.JoinVertical(lipgloss.Top, sections...))
+}
+
+func (m appModel) taskInputFooterText() string {
+	if m.mutationInFlight() {
+		return "正在提交创题任务..."
+	}
+	if m.input.mode == taskInputLoadConfig {
+		if m.input.loadingConfig {
+			return "正在加载配置...  [esc] 取消"
+		}
+		return "[enter] 加载配置  [esc] 取消"
+	}
+	return "[tab] 下一项  [space] 切换 0-to-1  [enter] 提交  [esc] 取消"
 }
 
 func (m appModel) runActionFooterText() string {

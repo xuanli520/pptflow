@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 )
 
 func taskInputConfigFixture() taskInputConfig {
@@ -164,5 +165,38 @@ func TestAppLoadsFileConfigBeforeStartingAuthoring(t *testing.T) {
 	mutation, ok := startCommand().(taskBoardMutationMsg)
 	if !ok || mutation.err != nil || len(stub.startRequests) != 1 || stub.startRequests[0].Title != "Corrected title" {
 		t.Fatalf("start from loaded config = %#v, requests=%+v", mutation, stub.startRequests)
+	}
+}
+
+func TestAppRendersNewTaskConfigInputAndEscReturnsToBoard(t *testing.T) {
+	stub := &taskBoardGatewayStub{snapshot: taskBoardTestSnapshot(true)}
+	model := loadedTaskBoardModel(t, stub)
+	model.width, model.height = 120, 30
+
+	updated, _ := model.handleKey(keyRune('n'), nil)
+	model = updated.(appModel)
+	rendered := ansi.Strip(model.View())
+	for _, expected := range []string{"从配置文件加载新题", "Config file ", "[enter] 加载配置", "[esc] 取消"} {
+		if !strings.Contains(rendered, expected) {
+			t.Fatalf("new task config input did not render %q:\n%s", expected, rendered)
+		}
+	}
+	if strings.Contains(rendered, "[n] 从配置新建") {
+		t.Fatalf("new task config input retained the board footer:\n%s", rendered)
+	}
+
+	updated, _ = model.handleKey(keyRune('q'), nil)
+	model = updated.(appModel)
+	if value := model.input.configPathInput.Value(); value != "q" {
+		t.Fatalf("visible config input did not receive keyboard focus: %q", value)
+	}
+	updated, _ = model.handleKey(tea.KeyMsg{Type: tea.KeyEsc}, nil)
+	model = updated.(appModel)
+	if model.input.Visible() {
+		t.Fatal("escape did not close the new task config input")
+	}
+	rendered = ansi.Strip(model.View())
+	if strings.Contains(rendered, "从配置文件加载新题") || !strings.Contains(rendered, "[n] 从配置新建") {
+		t.Fatalf("escape did not restore the board view:\n%s", rendered)
 	}
 }

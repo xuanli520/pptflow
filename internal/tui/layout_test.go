@@ -124,6 +124,19 @@ func TestEveryScreenFitsItsWindow(t *testing.T) {
 			assertFitsWindow(t, "board", model.View(), width, height)
 		})
 
+		t.Run("new task config input", func(t *testing.T) {
+			model := newModel(t)
+			model.input.BeginConfigLoad()
+			assertFitsWindow(t, "new task config input", model.View(), width, height)
+		})
+
+		t.Run("new task edit input", func(t *testing.T) {
+			model := newModel(t)
+			model.input.Show()
+			model.input.validationErr = "URL, SHA, base image, slug, title, task type, application, code language, objective, and reason are required"
+			assertFitsWindow(t, "new task edit input", model.View(), width, height)
+		})
+
 		t.Run("detail", func(t *testing.T) {
 			model := newModel(t)
 			model.detail = newDetailModel(model.board.SelectedTask())
