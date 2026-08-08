@@ -300,9 +300,15 @@ func TestStandardAuthoringPackageAdmissionStrictlyParsesRootContract(t *testing.
 }
 
 func TestStandardAuthoringPackageAdmissionRejectsCandidateEvidenceThatDoesNotMatchFiles(t *testing.T) {
+	// Each case asserts the specific rejection reason rather than a shared
+	// substring. A receipt that cannot be parsed, a receipt that reports a
+	// rejection, and a receipt that names a different candidate are three
+	// different operator problems, so collapsing them into one assertion would
+	// let any of the three silently take another's message.
 	for _, test := range []struct {
 		name   string
 		mutate func(map[string][]byte)
+		want   string
 	}{
 		{
 			name: "candidate script changed",
@@ -310,6 +316,7 @@ func TestStandardAuthoringPackageAdmissionRejectsCandidateEvidenceThatDoesNotMat
 				contents["solve_script"] = []byte("#!/bin/sh\necho tampered\n")
 				contents["_preserve_v3_evidence"] = []byte("true")
 			},
+			want: "candidate snapshot does not bind",
 		},
 		{
 			name: "validation receipt changed",
@@ -318,14 +325,15 @@ func TestStandardAuthoringPackageAdmissionRejectsCandidateEvidenceThatDoesNotMat
 				contents["validation_receipt"] = append(receipt, 'x')
 				contents["_preserve_v3_evidence"] = []byte("true")
 			},
+			want: "is not a readable receipt",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newStandardAuthoringContractStageInputFixture(t, workflowkit.StageKey(workflowadapter.CodeEdgePackageAdmission))
 			test.mutate(fixture.contents)
 			_, err := standardAuthoringPackageAdmissionInputs(context.Background(), fixture.request(t), fixture.run)
-			if err == nil || !strings.Contains(err.Error(), "candidate") {
-				t.Fatalf("mismatched candidate evidence error = %v", err)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("mismatched candidate evidence error = %v, want %q", err, test.want)
 			}
 		})
 	}

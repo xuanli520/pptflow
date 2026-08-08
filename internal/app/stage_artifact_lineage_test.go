@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 	"github.com/purplevoid/harbor-factory/internal/workflowruntime"
@@ -163,5 +164,64 @@ func TestPersistStageArtifactsBindsImmutableOutputToFrozenLineage(t *testing.T) 
 	optionalChild.Inputs[0].Required = false
 	if bindings, err := resolveStageInputs(ctx, dataStore, services.core.objects, run, revision, optionalChild); err != nil || len(bindings) != 0 {
 		t.Fatalf("missing optional object input = %+v, %v; want unavailable binding omitted", bindings, err)
+	}
+}
+
+// TestLaterArtifactCandidateOrdersAcrossStageKeysByCompletion pins the rule that
+// selects a producer when two different stages write the same artifact name.
+//
+// Ordinal counts attempts of one stage key, so it is only an ordering across
+// retries of that same stage. Comparing it across stage keys ranked stages by
+// how often they had run: host_candidate_verify runs once per repair wave and
+// reached ordinal 18 while authoring_repair reached 9, so the verifier's older
+// validation_receipt permanently outranked the repair's fresh one. Package
+// admission then received a receipt describing the pre-repair candidate
+// alongside the post-repair candidate_snapshot and failed closed on the digest
+// mismatch every time repair actually changed the candidate.
+func TestLaterArtifactCandidateOrdersAcrossStageKeysByCompletion(t *testing.T) {
+	at := func(minute int) *time.Time {
+		moment := time.Date(2026, 8, 8, 0, minute, 0, 0, time.UTC)
+		return &moment
+	}
+	verifier := stageArtifactCandidate{
+		attempt: store.StageAttempt{ID: "hcv-18", StageKey: "host_candidate_verify", Ordinal: 18, FinishedAt: at(26)},
+		ref:     store.ArtifactRef{ID: "ref-hcv", ArtifactKey: "validation_receipt"},
+	}
+	repair := stageArtifactCandidate{
+		attempt: store.StageAttempt{ID: "repair-9", StageKey: "authoring_repair", Ordinal: 9, FinishedAt: at(32)},
+		ref:     store.ArtifactRef{ID: "ref-repair", ArtifactKey: "validation_receipt"},
+	}
+
+	if !laterArtifactCandidate(repair.attempt, repair.ref, verifier) {
+		t.Fatal("authoring_repair finished after host_candidate_verify but did not supersede it; a lower ordinal on a different stage key must not lose")
+	}
+	if laterArtifactCandidate(verifier.attempt, verifier.ref, repair) {
+		t.Fatal("host_candidate_verify finished earlier and must not supersede the repair output on ordinal alone")
+	}
+
+	// Retries of one stage key must still order by ordinal, which is the
+	// meaning ordinal actually has.
+	first := stageArtifactCandidate{
+		attempt: store.StageAttempt{ID: "repair-9", StageKey: "authoring_repair", Ordinal: 9, FinishedAt: at(32)},
+		ref:     store.ArtifactRef{ID: "ref-a"},
+	}
+	retry := store.StageAttempt{ID: "repair-10", StageKey: "authoring_repair", Ordinal: 10, FinishedAt: at(30)}
+	if !laterArtifactCandidate(retry, store.ArtifactRef{ID: "ref-b"}, first) {
+		t.Fatal("a higher ordinal of the same stage key must win regardless of recorded completion time")
+	}
+}
+
+// TestStageArtifactDurableAtFallsBackWhenUnfinished keeps an attempt without a
+// completion timestamp comparable instead of collapsing to the zero time, which
+// would make every unfinished attempt tie and fall through to an ID comparison.
+func TestStageArtifactDurableAtFallsBackWhenUnfinished(t *testing.T) {
+	created := time.Date(2026, 8, 8, 0, 10, 0, 0, time.UTC)
+	finished := time.Date(2026, 8, 8, 0, 20, 0, 0, time.UTC)
+
+	if got := stageArtifactDurableAt(store.StageAttempt{CreatedAt: created}); !got.Equal(created) {
+		t.Fatalf("unfinished attempt durable-at = %s, want creation time %s", got, created)
+	}
+	if got := stageArtifactDurableAt(store.StageAttempt{CreatedAt: created, FinishedAt: &finished}); !got.Equal(finished) {
+		t.Fatalf("finished attempt durable-at = %s, want completion time %s", got, finished)
 	}
 }

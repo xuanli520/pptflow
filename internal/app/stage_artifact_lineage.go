@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/purplevoid/harbor-factory/internal/harbor/store"
 	"github.com/purplevoid/harbor-factory/internal/harbor/workflowadapter"
@@ -432,9 +433,32 @@ func artifactObjectUnavailable(err error) bool {
 		errors.Is(err, workflowruntime.ErrUnsafeObjectPath)
 }
 
+// laterArtifactCandidate reports whether a candidate supersedes the one already
+// selected for the same artifact name.
+//
+// Ordinal counts attempts *within one stage key*, so it orders retries of that
+// stage and nothing else. Comparing it across stage keys is a category error:
+// a stage the graph re-enters every wave (host_candidate_verify) accumulates a
+// far higher ordinal than a stage that runs once per wave (authoring_repair),
+// so the busier stage would win every contest for a shared artifact name no
+// matter how stale its copy was. That is what let a pre-repair
+// validation_receipt outrank the fresh receipt the repair attempt published
+// alongside its new candidate_snapshot, leaving package admission to compare a
+// new candidate against an old receipt.
+//
+// Same stage key therefore still orders by ordinal, preserving retry
+// semantics. Different stage keys order by when the producing attempt actually
+// became durable, which is the only comparable fact between them.
 func laterArtifactCandidate(attempt store.StageAttempt, reference store.ArtifactRef, current stageArtifactCandidate) bool {
-	if attempt.Ordinal != current.attempt.Ordinal {
-		return attempt.Ordinal > current.attempt.Ordinal
+	if attempt.StageKey == current.attempt.StageKey {
+		if attempt.Ordinal != current.attempt.Ordinal {
+			return attempt.Ordinal > current.attempt.Ordinal
+		}
+	} else {
+		candidateAt, currentAt := stageArtifactDurableAt(attempt), stageArtifactDurableAt(current.attempt)
+		if !candidateAt.Equal(currentAt) {
+			return candidateAt.After(currentAt)
+		}
 	}
 	if !attempt.CreatedAt.Equal(current.attempt.CreatedAt) {
 		return attempt.CreatedAt.After(current.attempt.CreatedAt)
@@ -443,6 +467,17 @@ func laterArtifactCandidate(attempt store.StageAttempt, reference store.Artifact
 		return reference.TurnOrdinal > current.ref.TurnOrdinal
 	}
 	return reference.ID > current.ref.ID
+}
+
+// stageArtifactDurableAt is when a completed attempt's artifacts became
+// durable. FinishedAt is the truth for a completed attempt; CreatedAt is the
+// fallback so a row missing its finish timestamp still orders deterministically
+// instead of collapsing to the zero time.
+func stageArtifactDurableAt(attempt store.StageAttempt) time.Time {
+	if attempt.FinishedAt != nil {
+		return attempt.FinishedAt.UTC()
+	}
+	return attempt.CreatedAt.UTC()
 }
 
 // stageArtifactManifestPayload is deliberately timestamp-free. A crash after

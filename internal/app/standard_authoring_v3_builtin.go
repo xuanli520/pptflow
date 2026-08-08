@@ -35,8 +35,20 @@ func validateStandardAuthoringV3MaterializationEvidence(snapshotRaw, receiptRaw,
 	// legitimately resume hours after HostCandidateVerify, and every stage
 	// artifact below still proves the receipt names this exact candidate.
 	var receipt workflowkit.ValidationReceipt
-	if err := decodeStrictJSON(string(receiptRaw), &receipt); err != nil || receipt.Validate() != nil || receipt.Verdict != workflowkit.ValidationPass || receipt.SnapshotDigest != snapshot.Digest {
-		return fmt.Errorf("Standard authoring V3 validation receipt is not a passing receipt for the candidate")
+	if err := decodeStrictJSON(string(receiptRaw), &receipt); err != nil || receipt.Validate() != nil {
+		return fmt.Errorf("Standard authoring V3 validation receipt is not a readable receipt")
+	}
+	if receipt.Verdict != workflowkit.ValidationPass {
+		return fmt.Errorf("Standard authoring V3 validation receipt did not pass: verdict %q", receipt.Verdict)
+	}
+	// A receipt that passed but names a different snapshot is a lineage fault,
+	// not a failed validation. Reporting both as one sentence sent a reader
+	// looking for a rejected receipt when every receipt involved had passed and
+	// the real fault was that the bound receipt described the pre-repair
+	// candidate. Name the two digests so the mismatch is diagnosable from the
+	// error alone.
+	if receipt.SnapshotDigest != snapshot.Digest {
+		return fmt.Errorf("Standard authoring V3 validation receipt describes candidate %s but the bound candidate is %s", receipt.SnapshotDigest, snapshot.Digest)
 	}
 	var attestation standardAuthoringFinalAttestation
 	if err := decodeStrictJSON(string(attestationRaw), &attestation); err != nil ||
