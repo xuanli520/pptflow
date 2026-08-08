@@ -196,6 +196,10 @@ func (s *reviewScreen) findingSection(inspection app.TaskBoardReviewInspection, 
 			fields = append(fields, detailField("记录时间", formatDetailTime(finding.RecordedAt), width))
 		}
 		block := detailFields(fields...)
+		// The cited diagnostic comes before the verbatim body: it is the only
+		// human-readable account of why the critic objected, and a reader should
+		// reach it without scrolling past the finding envelope.
+		block += renderFindingDiagnostics(finding, width)
 		if body := strings.TrimSpace(finding.Body); body != "" {
 			block += "\n" + wrapDisplay(body, max(1, width-detailFieldGutter))
 		}
@@ -212,6 +216,53 @@ func (s *reviewScreen) findingSection(inspection app.TaskBoardReviewInspection, 
 		body += "\n" + mutedStyle.Render(inspection.AgentFindingsMessage)
 	}
 	return renderDetailSection(fmt.Sprintf("Agent 评审意见 (%d)", len(inspection.AgentFindings)), body, width)
+}
+
+// renderFindingDiagnostics renders the failing checks a finding cites.
+//
+// A WorkflowFinding carries no prose: its fields are a closed code, two stage
+// keys, and digests. Rendering only those told an operator that a critic
+// objected but never why. The cited validation receipt holds the actual
+// account -- which command failed, its exit code, and its output tail -- so
+// this block is the readable part of an otherwise machine-facing record.
+//
+// It returns a leading newline with its content, or the empty string, so a
+// caller can append it unconditionally.
+func renderFindingDiagnostics(finding app.TaskBoardReviewFinding, width int) string {
+	if len(finding.Diagnostics) == 0 {
+		if finding.DiagnosticMessage == "" {
+			return ""
+		}
+		return "\n" + mutedStyle.Render(wrapDisplay(finding.DiagnosticMessage, max(1, width-detailFieldGutter)))
+	}
+	rows := make([]string, 0, len(finding.Diagnostics)*3+1)
+	if finding.DiagnosticSummary != "" {
+		rows = append(rows, detailField("校验结论", finding.DiagnosticSummary, width))
+	}
+	for _, diagnostic := range finding.Diagnostics {
+		// The command id and its exit code belong on one line: the pair is the
+		// identity of the failure, and splitting them across rows made a reader
+		// re-associate them by eye.
+		rows = append(rows, styleFail.Render(truncateDisplay(
+			fmt.Sprintf("✗ %s (exit %d)", diagnostic.CommandID, diagnostic.ExitCode),
+			max(1, width-detailFieldGutter),
+		)))
+		// Tails are pre-bounded by the application layer. They are indented as
+		// verbatim output rather than wrapped into prose, because a stack trace
+		// or assertion line loses its meaning when reflowed.
+		for _, tail := range []string{diagnostic.StderrTail, diagnostic.StdoutTail} {
+			for _, line := range strings.Split(strings.TrimRight(tail, "\n"), "\n") {
+				if strings.TrimSpace(line) == "" {
+					continue
+				}
+				rows = append(rows, mutedStyle.Render(truncateDisplay("    "+line, max(1, width-detailFieldGutter))))
+			}
+		}
+	}
+	if finding.DiagnosticMessage != "" {
+		rows = append(rows, mutedStyle.Render(wrapDisplay(finding.DiagnosticMessage, max(1, width-detailFieldGutter))))
+	}
+	return "\n" + strings.Join(rows, "\n")
 }
 
 // decisionSection shows the immutable decision history for this gate.

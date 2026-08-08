@@ -283,3 +283,81 @@ func TestReviewPromptEnterInsertsNewlineAndCtrlSSubmits(t *testing.T) {
 		t.Fatalf("submitted reason = %+v, want the multi-line value %q", stub.decisionRequests, multiline)
 	}
 }
+
+// TestReviewScreenRendersCitedDiagnosticsInsteadOfDigestOnly is the regression
+// guard for the defect where the gate screen showed a critic's opinion as raw
+// envelope JSON plus a bare digest.
+//
+// A WorkflowFinding is metadata by design: a closed code, two stage keys, and
+// three digests, none of which say why the critic objected. The reason lives in
+// the validation receipt the finding cites through its diagnostic digest, so the
+// screen must resolve that citation and show the failing command. Rendering the
+// digest alone left the one actionable sentence unreachable from the terminal.
+func TestReviewScreenRendersCitedDiagnosticsInsteadOfDigestOnly(t *testing.T) {
+	recorded := time.Date(2026, 8, 8, 0, 29, 22, 0, time.UTC)
+	stub := reviewInspectionStub()
+	stub.reviewInspection.AgentFindings = []app.TaskBoardReviewFinding{{
+		ArtifactKey: "test_quality_finding", StageKey: workflowadapter.TestQualityCritic,
+		Code: "test_quality_defect", ProducingStage: workflowadapter.TestQualityCritic,
+		TargetWriter:   workflowadapter.AuthoringRepair,
+		EvidenceDigest: "sha256:99e41d24", CandidateDigest: "sha256:d634e845",
+		RecordedAt:        &recorded,
+		DiagnosticSummary: "裁决 pass · 6 项检查 · 1 项失败",
+		Diagnostics: []app.TaskBoardReviewDiagnostic{{
+			CommandID: "baseline_verify", ExitCode: 1, TestStarted: true,
+			StderrTail: "FAIL: ScopedRouteBindingResolver.php is missing\n",
+		}},
+	}}
+
+	model := loadedTaskBoardModel(t, stub)
+	model.width, model.height = 120, 60
+	model.detail = newDetailModel(model.board.SelectedTask())
+	updated, command := model.handleKey(keyRune('v'), nil)
+	model = updated.(appModel)
+	model = applyCommand(t, model, command)
+
+	rendered := ansi.Strip(model.View())
+	for _, expected := range []string{
+		// The failing check and its exit code: the identity of the objection.
+		"baseline_verify", "exit 1",
+		// The actual reason, which previously existed only behind a digest.
+		"FAIL: ScopedRouteBindingResolver.php is missing",
+		// The verdict beside the counts, so a passing receipt carrying a failing
+		// baseline check cannot be misread as a rejected one.
+		"裁决 pass", "1 项失败",
+	} {
+		if !strings.Contains(rendered, expected) {
+			t.Errorf("review screen missing cited diagnostic %q", expected)
+		}
+	}
+
+	for _, size := range terminalSizes {
+		sized := model
+		sized.width, sized.height = size[0], size[1]
+		assertFitsWindow(t, "review gate diagnostics", sized.View(), size[0], size[1])
+	}
+}
+
+// TestReviewScreenStatesWhenCitedReceiptHasNoFailingCheck covers the pass-code
+// finding. solution_integrity_pass cites a receipt whose every check passed, and
+// an empty diagnostics block there is correct rather than a failed read -- so the
+// screen must say so instead of rendering nothing.
+func TestReviewScreenStatesWhenCitedReceiptHasNoFailingCheck(t *testing.T) {
+	stub := reviewInspectionStub()
+	stub.reviewInspection.AgentFindings = []app.TaskBoardReviewFinding{{
+		ArtifactKey: "solution_integrity_finding", StageKey: workflowadapter.SolutionIntegrityCritic,
+		Code: "solution_integrity_pass", TargetWriter: workflowadapter.AuthoringRepair,
+		DiagnosticMessage: "该回执所有检查均通过",
+	}}
+
+	model := loadedTaskBoardModel(t, stub)
+	model.width, model.height = 120, 60
+	model.detail = newDetailModel(model.board.SelectedTask())
+	updated, command := model.handleKey(keyRune('v'), nil)
+	model = updated.(appModel)
+	model = applyCommand(t, model, command)
+
+	if rendered := ansi.Strip(model.View()); !strings.Contains(rendered, "该回执所有检查均通过") {
+		t.Error("review screen did not state that the cited receipt had no failing check")
+	}
+}

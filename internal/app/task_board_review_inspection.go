@@ -28,6 +28,14 @@ const (
 	// taskBoardReviewFindingTruncationNote is appended to a clipped body so a reader
 	// can never mistake a partial finding for the complete one.
 	taskBoardReviewFindingTruncationNote = "\n…（正文超出 32KiB 上限，已截断）"
+	// taskBoardReviewDiagnosticTailLimit bounds one command tail. A container
+	// build log can be megabytes; the tail an operator needs to act on is the
+	// last few lines, so the rest is never carried into a terminal.
+	taskBoardReviewDiagnosticTailLimit = 1024
+	// taskBoardReviewDiagnosticLimit bounds how many failing checks one finding
+	// contributes, so a receipt reporting every command as failed cannot flood
+	// the gate screen.
+	taskBoardReviewDiagnosticLimit = 8
 )
 
 // TaskBoardInspectReviewRequest selects one open review gate previously seen in
@@ -110,6 +118,29 @@ type TaskBoardReviewFinding struct {
 	RecordedAt *time.Time `json:"recorded_at,omitempty"`
 	// Message reports why this finding's body is unavailable.
 	Message string `json:"message,omitempty"`
+	// Diagnostics are the failing checks from the validation receipt this
+	// finding cites through its DiagnosticDigest. A WorkflowFinding carries no
+	// prose by design, so this is the only human-readable account of why a
+	// critic objected. Without it the gate screen could show a finding code and
+	// a digest but never the reason behind either.
+	Diagnostics []TaskBoardReviewDiagnostic `json:"diagnostics,omitempty"`
+	// DiagnosticSummary counts the checks behind Diagnostics, so a reader can
+	// tell "1 of 6 failed" from "6 of 6 failed" without expanding anything.
+	DiagnosticSummary string `json:"diagnostic_summary,omitempty"`
+	// DiagnosticMessage explains why Diagnostics is empty when a digest was
+	// cited, rather than leaving the section silently blank.
+	DiagnosticMessage string `json:"diagnostic_message,omitempty"`
+}
+
+// TaskBoardReviewDiagnostic is one failing check from the validation receipt a
+// finding cites. It is the actionable content an operator decides against.
+type TaskBoardReviewDiagnostic struct {
+	CommandID   string `json:"command_id"`
+	ExitCode    int    `json:"exit_code"`
+	TestStarted bool   `json:"test_started"`
+	// StdoutTail and StderrTail are bounded by taskBoardReviewDiagnosticTailLimit.
+	StdoutTail string `json:"stdout_tail,omitempty"`
+	StderrTail string `json:"stderr_tail,omitempty"`
 }
 
 // InspectReview returns the full read-only readout for one open review gate.
@@ -303,7 +334,7 @@ func (service *TaskBoardService) readTaskBoardReviewFindings(ctx context.Context
 		if !found {
 			continue
 		}
-		findings = append(findings, service.readTaskBoardReviewFinding(ctx, *run, key, candidate))
+		findings = append(findings, service.readTaskBoardReviewFinding(ctx, *run, subject, stages, key, candidate))
 	}
 	return findings, ""
 }
@@ -321,7 +352,7 @@ func taskBoardIsReviewFindingArtifact(key string) bool {
 // lineage, and object path the board's validation readout already uses. A read
 // or decode failure degrades to a message on that finding instead of failing
 // the whole inspection.
-func (service *TaskBoardService) readTaskBoardReviewFinding(ctx context.Context, run store.WorkflowRun, key string, candidate stageArtifactCandidate) TaskBoardReviewFinding {
+func (service *TaskBoardService) readTaskBoardReviewFinding(ctx context.Context, run store.WorkflowRun, subject workflowRunSubject, stages []store.StageAttempt, key string, candidate stageArtifactCandidate) TaskBoardReviewFinding {
 	finding := TaskBoardReviewFinding{
 		ArtifactKey: key,
 		StageKey:    candidate.attempt.StageKey,
@@ -338,11 +369,8 @@ func (service *TaskBoardService) readTaskBoardReviewFinding(ctx context.Context,
 		finding.Message = "读取意见清单失败: " + err.Error()
 		return finding
 	}
-	subject, err := service.core.resolveWorkflowRunSubject(ctx, run)
-	if err != nil {
-		finding.Message = "解析 Run 主体失败: " + err.Error()
-		return finding
-	}
+	// The caller already resolved this Run's subject to screen the artifact refs
+	// it selected, so the same value is threaded in rather than re-resolved here.
 	if index.manifest.SubjectRevisionID != subject.subjectRevisionID() || index.manifest.SubjectDigest != subject.subjectDigest() ||
 		index.manifest.WorkflowFingerprint != run.DefinitionHash || index.payload.RunID != run.ID ||
 		index.payload.StageAttemptID != candidate.ref.AttemptID || string(index.payload.StageKey) != candidate.ref.StageKey {
@@ -383,5 +411,148 @@ func (service *TaskBoardService) readTaskBoardReviewFinding(ctx context.Context,
 	finding.TargetWriter = string(decoded.TargetWriter)
 	finding.EvidenceDigest = string(decoded.EvidenceDigest)
 	finding.CandidateDigest = string(decoded.CandidateDigest)
+
+	// A WorkflowFinding is metadata only: it binds a closed code to digests and
+	// carries no prose at all. The reason a critic objected lives in the
+	// validation receipt named by DiagnosticDigest, so resolve it here. Showing
+	// the digest alone tells an operator that evidence exists without letting
+	// them read it, which is the same as showing nothing.
+	if decoded.DiagnosticDigest != "" {
+		finding.Diagnostics, finding.DiagnosticSummary, finding.DiagnosticMessage =
+			service.readTaskBoardReviewDiagnostics(ctx, run, subject, stages, decoded.DiagnosticDigest)
+	}
 	return finding
+}
+
+// readTaskBoardReviewDiagnostics resolves the validation receipt a finding cites
+// through its DiagnosticDigest and returns that receipt's failing checks.
+//
+// DiagnosticDigest is the receipt's own canonical digest, not the digest of the
+// object that holds it, so the receipt cannot be fetched by content address. It
+// is located by decoding this Run's validation_receipt artifacts and matching
+// that field. An artifact that fails Run lineage is skipped rather than
+// rendered: this is a display path feeding a decision, and showing foreign
+// evidence beside a gate is worse than showing none.
+func (service *TaskBoardService) readTaskBoardReviewDiagnostics(ctx context.Context, run store.WorkflowRun, subject workflowRunSubject, stages []store.StageAttempt, diagnosticDigest workflowkit.Fingerprint) ([]TaskBoardReviewDiagnostic, string, string) {
+	candidates := make([]stageArtifactCandidate, 0, len(stages))
+	for _, attempt := range stages {
+		if attempt.ExecutionStatus != store.StageExecutionCompleted || strings.TrimSpace(attempt.ArtifactManifestID) == "" {
+			continue
+		}
+		references, err := service.core.store.ListArtifactRefsForAttempt(ctx, attempt.ID)
+		if err != nil {
+			return nil, "", "读取校验回执引用失败: " + err.Error()
+		}
+		for _, reference := range references {
+			if reference.ArtifactKey != taskBoardValidationReceiptArtifactKey {
+				continue
+			}
+			if reference.RunID != run.ID || reference.StageKey != attempt.StageKey || reference.AttemptID != attempt.ID ||
+				reference.SubjectRevisionID != subject.subjectRevisionID() || reference.SubjectDigest != subject.subjectDigest() ||
+				reference.WorkflowFingerprint != run.DefinitionHash {
+				continue
+			}
+			candidates = append(candidates, stageArtifactCandidate{attempt: attempt, ref: reference})
+		}
+	}
+	// Newest first: a finding almost always cites the current wave's receipt, so
+	// the match lands on the first read and no further objects are touched.
+	sort.SliceStable(candidates, func(left, right int) bool {
+		return laterArtifactCandidate(candidates[left].attempt, candidates[left].ref, candidates[right])
+	})
+	for _, candidate := range candidates {
+		receipt, readable := service.readTaskBoardValidationReceipt(ctx, run, subject, candidate)
+		if !readable || receipt.Digest != diagnosticDigest {
+			continue
+		}
+		return taskBoardReviewDiagnosticsFromReceipt(receipt)
+	}
+	return nil, "", "未能在本 Run 中定位该意见引用的校验回执"
+}
+
+// taskBoardValidationReceiptArtifactKey is the artifact a finding's
+// DiagnosticDigest can name. It is declared here rather than imported because
+// this read is a projection concern, not a workflow contract.
+const taskBoardValidationReceiptArtifactKey = "validation_receipt"
+
+// readTaskBoardValidationReceipt reads one validation receipt through the same
+// manifest, lineage, and object path the rest of this file uses. Every failure
+// degrades to "not readable" so a single unreadable receipt cannot fail the
+// whole gate inspection.
+func (service *TaskBoardService) readTaskBoardValidationReceipt(ctx context.Context, run store.WorkflowRun, subject workflowRunSubject, candidate stageArtifactCandidate) (workflowkit.ValidationReceipt, bool) {
+	index, err := loadStageArtifactManifestIndex(ctx, service.core.store, candidate.ref.ManifestID)
+	if err != nil {
+		return workflowkit.ValidationReceipt{}, false
+	}
+	if index.manifest.SubjectRevisionID != subject.subjectRevisionID() || index.manifest.SubjectDigest != subject.subjectDigest() ||
+		index.manifest.WorkflowFingerprint != run.DefinitionHash || index.payload.RunID != run.ID ||
+		index.payload.StageAttemptID != candidate.ref.AttemptID || string(index.payload.StageKey) != candidate.ref.StageKey {
+		return workflowkit.ValidationReceipt{}, false
+	}
+	object, err := index.objectFor(candidate.ref)
+	if err != nil {
+		return workflowkit.ValidationReceipt{}, false
+	}
+	raw, err := service.core.objects.ReadAll(ctx, object)
+	if err != nil {
+		return workflowkit.ValidationReceipt{}, false
+	}
+	var receipt workflowkit.ValidationReceipt
+	if err := decodeStrictJSON(string(raw), &receipt); err != nil {
+		return workflowkit.ValidationReceipt{}, false
+	}
+	return receipt, true
+}
+
+// taskBoardReviewDiagnosticsFromReceipt selects the checks an operator can act
+// on. Passing checks are counted but not listed: a receipt carries every command
+// it ran, and reproducing a successful container build log is what made this
+// readout unreadable in the first place.
+func taskBoardReviewDiagnosticsFromReceipt(receipt workflowkit.ValidationReceipt) ([]TaskBoardReviewDiagnostic, string, string) {
+	failed := 0
+	for _, report := range receipt.Diagnostics {
+		if report.ExitCode != 0 {
+			failed++
+		}
+	}
+	// The verdict is stated alongside the counts because a passing receipt with
+	// a failing baseline check is normal here, and that combination is exactly
+	// what an operator misreads when only one of the two is shown.
+	summary := fmt.Sprintf("裁决 %s · %d 项检查 · %d 项失败", receipt.Verdict, len(receipt.Diagnostics), failed)
+	diagnostics := make([]TaskBoardReviewDiagnostic, 0, failed)
+	for _, report := range receipt.Diagnostics {
+		if report.ExitCode == 0 {
+			continue
+		}
+		if len(diagnostics) == taskBoardReviewDiagnosticLimit {
+			break
+		}
+		diagnostics = append(diagnostics, TaskBoardReviewDiagnostic{
+			CommandID:   report.CommandID,
+			ExitCode:    report.ExitCode,
+			TestStarted: report.TestStarted,
+			StdoutTail:  boundTaskBoardDiagnosticTail(report.StdoutTail),
+			StderrTail:  boundTaskBoardDiagnosticTail(report.StderrTail),
+		})
+	}
+	if len(diagnostics) == 0 {
+		// A pass-code finding cites a passing receipt. Stating that is the
+		// readout; an empty list with no sentence would look like a failed read.
+		return nil, summary, "该回执所有检查均通过"
+	}
+	if failed > len(diagnostics) {
+		return diagnostics, summary, fmt.Sprintf("仅显示前 %d 项失败检查", len(diagnostics))
+	}
+	return diagnostics, summary, ""
+}
+
+// boundTaskBoardDiagnosticTail keeps the end of a command tail. A failure reason
+// is at the end of its output, and a build log can be megabytes.
+func boundTaskBoardDiagnosticTail(tail string) string {
+	tail = strings.TrimSpace(tail)
+	if len(tail) > taskBoardReviewDiagnosticTailLimit {
+		tail = "…" + tail[len(tail)-taskBoardReviewDiagnosticTailLimit:]
+	}
+	// Applied after the cut so a rune split by the slice cannot reach a terminal.
+	return strings.ToValidUTF8(tail, "?")
 }
